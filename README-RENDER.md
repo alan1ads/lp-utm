@@ -55,7 +55,7 @@ Once you've confirmed everything is working:
 
 1. Go to your service in Render.com dashboard
 2. Update the `TESTING_MODE` environment variable to `false`
-3. This will make the bot check URLs daily at 10 AM ET instead of every 3 minutes
+3. This will make the bot check URLs daily at 7 AM ET instead of every 3 minutes
 
 ### Important Notes About Deployment
 

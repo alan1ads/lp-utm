@@ -18,6 +18,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from gspread_formatting import *
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import traceback
 
 # Load environment variables
 load_dotenv()
@@ -55,6 +56,10 @@ WORKSHEET_ID = os.getenv('WORKSHEET_ID', '1795345169')  # Default to the workshe
 # Define columns to check for URLs - can be configured in .env or hard-coded
 URL_COLUMNS = os.getenv('URL_COLUMNS', 'N,O,P,Q,R,S,T,U,V,W,X,Y,Z,AA,AB,AC,AD,AE,AF,AG,AH,AI,AJ,AK,AL,AM,AN,AO,AP,AQ,AR,AS,AT,AU,AV,AW,AX,AY,AZ,BA,BB,BC,BD,BE,BF,BG,BH,BI,BJ,BK,BL').split(',')
 CHECK_INTERVAL = 180  # 3 minutes in seconds for testing
+
+# Constants for batch processing
+BATCH_SIZE = 500  # Process 500 URLs before restarting the browser
+MAX_BROWSER_LIFETIME = 30  # Maximum minutes to keep a browser instance open
 
 # Print important configuration for debugging
 print("\n===== CONFIGURATION =====")
@@ -324,71 +329,75 @@ def reset_cell_formatting(sheet, row, col):
     print(f"Marked cell {cell_range} as bright blue (working URL)")
 
 async def check_url(driver, url, sheet, row, col, retry_count=0):
-    """Check a single URL and mark it red if it's not working"""
-    print(f"\n=== Checking URL: {url} at cell {col}{row} ===")
+    """Check if a URL is working and mark it in the spreadsheet"""
+    print(f"=== Checking URL: {url} at cell {col}{row} ===")
+    
+    # Track whether the URL is working
+    is_working = False
+    error_message = ""
     
     try:
-        # Add timeout to prevent hanging on problematic URLs
-        response = requests.get(url, timeout=30, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }, allow_redirects=True)
-        
-        print(f"Response status code: {response.status_code}")
-        print(f"Final URL after redirects: {response.url}")
-        
-        # Initialize status variables
-        url_is_down = False
-        error_message = None
-        
-        if response.status_code == 200:
-            # Check if domain is expired despite 200 status
-            is_expired, reason = analyze_domain_status(response.text, url, response.url, None, driver)
-            if is_expired:
-                url_is_down = True
-                error_message = f"Domain expired: {url}"
+        # Make the actual web request to check the URL
+        try:
+            timeout = 15  # Use a shorter timeout to avoid getting stuck
+            response = requests.get(url, timeout=timeout, allow_redirects=True)
+            
+            # Check for various error conditions
+            if response.status_code >= 400:
+                error_message = f"HTTP Status {response.status_code}"
+                print(f"❌ HTTP Error: {url} - {error_message}")
+                mark_cell_text_red(sheet, row, col)
             else:
-                print(f"✓ URL appears healthy: {url}")
-        elif response.status_code in [403, 404, 400, 500, 502, 503, 504]:
-            url_is_down = True
-            error_message = f"HTTP {response.status_code}: {url}"
-        else:
-            # Check other non-200 codes
-            url_is_down = True
-            error_message = f"HTTP {response.status_code}: {url}"
+                # URL might be working - analyze content
+                content = response.text
                 
-        # Update cell formatting based on URL status
-        if url_is_down:
-            print(f"❌ {error_message}")
+                # Analyze the domain status
+                title = None
+                try:
+                    soup = BeautifulSoup(content, 'html.parser')
+                    title_tag = soup.find('title')
+                    if title_tag:
+                        title = title_tag.text.strip()
+                except:
+                    title = None
+                
+                # Get the final URL after redirects
+                response_url = response.url
+                
+                # Extract domain from URL
+                domain_match = re.search(r'https?://([^/]+)', response_url)
+                if domain_match:
+                    domain = domain_match.group(1)
+                else:
+                    domain = response_url
+                
+                # Analyze the content to check domain status
+                domain_status = analyze_domain_status(content, domain, response_url, title, driver)
+                
+                if domain_status == "error":
+                    error_message = "Domain error detected"
+                    print(f"❌ Domain Error: {url} - {error_message}")
+                    mark_cell_text_red(sheet, row, col)
+                else:
+                    is_working = True
+                    print(f"✅ URL is working: {url}")
+                    reset_cell_formatting(sheet, row, col)
+                    
+        except requests.exceptions.RequestException as e:
+            error_message = str(e)
+            print(f"❌ Connection Error: {url} - {error_message}")
             mark_cell_text_red(sheet, row, col)
-            return False, error_message
-        else:
-            # URL is working, make sure text is black (in case it was previously red)
-            reset_cell_formatting(sheet, row, col)
-            return True, None
-            
-    except requests.exceptions.RequestException as e:
-        error_message = f"Connection Error: {url} - {str(e)}"
-        print(f"❌ {error_message}")
-        mark_cell_text_red(sheet, row, col)
-        return False, error_message
-        
     except Exception as e:
-        error_message = f"Unexpected Error: {url} - {str(e)}"
-        print(f"❌ {error_message}")
-        
-        # Try one more time if it's a Selenium-related error
-        if retry_count == 0 and "Selenium" in str(e):
-            print("Retrying with a fresh Selenium instance...")
-            try:
-                driver.quit()
-            except:
-                pass
-                
-            new_driver = setup_selenium()
-            return await check_url(new_driver, url, sheet, row, col, retry_count=1)
-            
-        mark_cell_text_red(sheet, row, col)
-        return False, error_message
+        error_message = str(e)
+        print(f"❌ Error checking URL: {url} - {error_message}")
+        if retry_count < 1:  # Try one more time if there's an unexpected error
+            print(f"Retrying URL: {url}")
+            await asyncio.sleep(2)  # Wait 2 seconds before retry
+            return await check_url(driver, url, sheet, row, col, retry_count + 1)
+        else:
+            mark_cell_text_red(sheet, row, col)
+    
+    return is_working, error_message
 
 def column_to_index(column_name):
     """Convert a column name (A, B, C, ..., Z, AA, AB, etc.) to a 0-based index"""
@@ -411,7 +420,7 @@ async def check_links():
     """Check all URLs in the specified columns of the spreadsheet"""
     try:
         print("Setting up Selenium...")
-        driver = setup_selenium()
+        driver = None  # Will initialize per batch
         
         print(f"Attempting to connect to Google Sheet with ID: {SHEET_URL}")
         try:
@@ -452,94 +461,112 @@ async def check_links():
             print(f"Using columns: {', '.join(URL_COLUMNS)}")
             
             # Skip header row (row 1)
-            failing_urls = []
-            checked_count = 0
-            total_urls = 0
+            row_counter = 2  # Google Sheets is 1-indexed but we're starting with row 2 (after header)
             
-            # Count URLs in relevant columns to provide progress updates
-            print("Scanning for URLs in the spreadsheet...")
-            for row_idx, row in enumerate(all_values, start=1):  # Start from row 1 (include header for completeness)
-                if row_idx % 100 == 0:
-                    print(f"Scanning row {row_idx}...")
-                for col in URL_COLUMNS:
-                    col_idx = column_to_index(col)  # Convert column letter to index
-                    if col_idx < len(row):
-                        cell_value = row[col_idx].strip()
-                        if not cell_value:
-                            continue
-                            
-                        if is_valid_url(cell_value):
-                            total_urls += 1
-                        else:
-                            # Try to extract URLs from text content
-                            extracted_urls = extract_urls_from_text(cell_value)
-                            total_urls += len(extracted_urls)
+            # Collect all URLs to check
+            urls_to_check = []
             
-            print(f"Found {total_urls} URLs to check across {len(URL_COLUMNS)} columns")
+            # Convert column letters to indices
+            column_indices = [column_to_index(col) for col in URL_COLUMNS]
             
-            # Process each URL in each specified column
-            for row_idx, row in enumerate(all_values, start=1):  # Start from row 1 (include header)
-                if row_idx % 50 == 0:
-                    print(f"Processing row {row_idx} of {len(all_values)}...")
-                    
-                for col in URL_COLUMNS:
-                    col_idx = column_to_index(col)  # Convert column letter to index
-                    
-                    # Skip if column index is out of range
-                    if col_idx >= len(row):
-                        continue
-                        
-                    cell_value = row[col_idx].strip()
-                    if not cell_value:
-                        continue
-                    
-                    # Extract URLs from the cell if it contains text
-                    urls = []
-                    if is_valid_url(cell_value):
-                        urls = [cell_value]
-                    else:
-                        # Try to extract URLs from text content
-                        urls = extract_urls_from_text(cell_value)
-                    
-                    # Check each URL in the cell
-                    for url in urls:
-                        checked_count += 1
-                        print(f"\nChecking URL {checked_count}/{total_urls}: {url} in cell {col}{row_idx}")
-                        
-                        # Add http:// if missing
-                        if not url.startswith(('http://', 'https://')):
-                            url = 'http://' + url
-                        
-                        # Check the URL
-                        is_working, error = await check_url(driver, url, sheet, row_idx, col)
-                        
-                        if not is_working:
-                            failing_urls.append(f"Row {row_idx}, Col {col}: {error}")
+            # Loop through all rows to collect URLs
+            for row_idx in range(1, len(all_values)):  # Start from index 1 (row 2)
+                row_data = all_values[row_idx]
+                for col_idx in column_indices:
+                    # Make sure the row has enough columns
+                    if col_idx < len(row_data):
+                        cell_value = row_data[col_idx]
+                        if cell_value:
+                            # Extract URLs from the cell
+                            urls = extract_urls_from_text(cell_value)
+                            if urls:
+                                # Add to the list of URLs to check
+                                for url in urls:
+                                    urls_to_check.append({
+                                        'url': url,
+                                        'row': row_idx + 1,  # +1 because we're 0-indexed but sheets are 1-indexed
+                                        'col': index_to_column(col_idx)
+                                    })
+            
+            print(f"Found {len(urls_to_check)} URLs to check")
+            
+            # Process URLs in batches
+            batch_count = 0
+            start_time = time.time()
+            
+            for i in range(0, len(urls_to_check), BATCH_SIZE):
+                batch_count += 1
+                batch = urls_to_check[i:i+BATCH_SIZE]
                 
-                # Yield control to allow other tasks to run
-                if row_idx % 10 == 0:
-                    await asyncio.sleep(0.1)
-            
-            # Send summary report
-            if failing_urls:
-                print("\nFound failing URLs...")
-                print("\n".join(failing_urls[:20]))
-                if len(failing_urls) > 20:
-                    print(f"...and {len(failing_urls) - 20} more.")
-            else:
-                print("\nAll URLs are healthy")
+                print(f"\n===== Processing Batch {batch_count} ({len(batch)} URLs) =====")
                 
-        finally:
-            print("Closing Selenium browser...")
+                # Close previous driver if it exists
+                if driver:
+                    try:
+                        print("Closing previous Selenium browser...")
+                        driver.quit()
+                    except Exception as e:
+                        print(f"Error closing browser: {str(e)}")
+                
+                # Initialize a new driver for this batch
+                print("Initializing a new Selenium browser...")
+                driver = setup_selenium()
+                
+                # Process the batch
+                for idx, url_data in enumerate(batch):
+                    if time.time() - start_time > MAX_BROWSER_LIFETIME * 60:
+                        print(f"Browser lifetime exceeded {MAX_BROWSER_LIFETIME} minutes. Reinitializing...")
+                        try:
+                            driver.quit()
+                        except:
+                            pass
+                        driver = setup_selenium()
+                        start_time = time.time()
+                        
+                    url = url_data['url']
+                    row = url_data['row']
+                    col = url_data['col']
+                    
+                    overall_index = i + idx + 1
+                    print(f"Checking URL {overall_index}/{len(urls_to_check)}: {url} in cell {col}{row}")
+                    
+                    try:
+                        await check_url(driver, url, sheet, row, col)
+                    except Exception as e:
+                        print(f"❌ Error checking URL {url}: {str(e)}")
+                        traceback.print_exc()
+                        try:
+                            mark_cell_text_red(sheet, row, col)
+                        except Exception as mark_err:
+                            print(f"Error marking cell: {str(mark_err)}")
+                
+                # Give Google's API a break between batches
+                print(f"Completed batch {batch_count}. Sleeping for 10 seconds to avoid API rate limits...")
+                await asyncio.sleep(10)
+            
+            # Close the last driver
+            if driver:
+                try:
+                    print("Closing Selenium browser...")
+                    driver.quit()
+                except Exception as e:
+                    print(f"Error closing browser: {str(e)}")
+            
+            print("\nFinished checking all URLs!")
+            
+        except Exception as e:
+            print(f"❌ Critical error processing spreadsheet: {str(e)}")
+            traceback.print_exc()
+    except Exception as e:
+        print(f"⚠️ Critical error: {str(e)}")
+        traceback.print_exc()
+    finally:
+        # Ensure the driver is closed
+        if driver:
             try:
                 driver.quit()
             except:
                 pass
-                
-    except Exception as e:
-        error_msg = f"⚠️ Critical error: {str(e)}"
-        print(error_msg)
-        send_slack_message(error_msg)
 
 async def wait_until_next_interval(interval_seconds):
     """Wait until the next scheduled check time"""
@@ -547,18 +574,28 @@ async def wait_until_next_interval(interval_seconds):
     await asyncio.sleep(interval_seconds)
 
 async def wait_until_next_run():
-    """Wait until 10 AM for the daily scheduled run"""
-    est = pytz.timezone('US/Eastern')
-    now = datetime.now(est)
-    target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    """Wait until the next scheduled run time (7 AM Eastern Time)"""
+    eastern = pytz.timezone('US/Eastern')
+    now = datetime.now(eastern)
     
-    # If it's already past 10 AM today, schedule for tomorrow
-    if now >= target:
-        target += timedelta(days=1)
+    # Schedule for 7 AM Eastern Time
+    target_hour = 7
+    target_minute = 0
     
-    # Calculate wait time
-    wait_seconds = (target - now).total_seconds()
-    print(f"\nWaiting until {target.strftime('%Y-%m-%d %H:%M:%S %Z')} to run next check")
+    # Calculate the next run time
+    if now.hour > target_hour or (now.hour == target_hour and now.minute >= target_minute):
+        # If it's already past 7 AM, schedule for tomorrow
+        next_run = now.replace(day=now.day+1, hour=target_hour, minute=target_minute, second=0, microsecond=0)
+    else:
+        # Schedule for today at 7 AM
+        next_run = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+    
+    # Calculate seconds until next run
+    wait_seconds = (next_run - now).total_seconds()
+    
+    print(f"Next check scheduled for {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"Waiting {wait_seconds/60/60:.2f} hours...")
+    
     await asyncio.sleep(wait_seconds)
 
 # Define a simple HTTP server for Render.com health checks
@@ -614,10 +651,10 @@ async def main():
             await wait_until_next_interval(CHECK_INTERVAL)
             await check_links()
     else:
-        print("\nRunning in PRODUCTION mode - checking URLs daily at 10 AM Eastern Time")
-        print("Now waiting for next scheduled check at 10 AM Eastern")
+        print("\nRunning in PRODUCTION mode - checking URLs daily at 7 AM Eastern Time")
+        print("Now waiting for next scheduled check at 7 AM Eastern")
         
-        # Wait for next 10 AM run
+        # Wait for next 7 AM run
         await wait_until_next_run()
         
         while True:
