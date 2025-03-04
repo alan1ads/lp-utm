@@ -50,10 +50,19 @@ except Exception as e:
 
 # Set up Slack webhook - get from environment variable
 SLACK_WEBHOOK_URL = os.getenv('SLACK_WEBHOOK_URL')
-SHEET_URL = os.getenv('SHEET_URL')
+SHEET_URL = os.getenv('SHEET_URL', '14Yk8UnQviC29ascf4frQfAEDWzM2_bp1UloRcnW8ZCg')
+WORKSHEET_ID = os.getenv('WORKSHEET_ID', '1795345169')  # Default to the worksheet ID from the URL
 # Define columns to check for URLs - can be configured in .env or hard-coded
-URL_COLUMNS = os.getenv('URL_COLUMNS', 'C,F,G,H').split(',')
+URL_COLUMNS = os.getenv('URL_COLUMNS', 'N,O,P,Q,R,S,T,U,V,W,X,Y,Z,AA,AB,AC,AD,AE,AF,AG,AH,AI,AJ,AK,AL,AM,AN,AO,AP,AQ,AR,AS,AT,AU,AV,AW,AX,AY,AZ,BA,BB,BC,BD,BE,BF,BG,BH,BI,BJ,BK,BL').split(',')
 CHECK_INTERVAL = 180  # 3 minutes in seconds for testing
+
+# Print important configuration for debugging
+print("\n===== CONFIGURATION =====")
+print(f"SHEET_URL: {SHEET_URL}")
+print(f"WORKSHEET_ID: {WORKSHEET_ID}")
+print(f"URL_COLUMNS: {','.join(URL_COLUMNS)}")
+print(f"TESTING_MODE: {os.getenv('TESTING_MODE', 'false')}")
+print("========================\n")
 
 def send_slack_message(message):
     """Send notification to Slack channel"""
@@ -404,17 +413,43 @@ async def check_links():
         print("Setting up Selenium...")
         driver = setup_selenium()
         
-        print("Attempting to connect to Google Sheet...")
+        print(f"Attempting to connect to Google Sheet with ID: {SHEET_URL}")
         try:
             # Open the spreadsheet
             spreadsheet = gc.open_by_key(SHEET_URL)
-            # Get the first worksheet
-            sheet = spreadsheet.get_worksheet(0)
+            print(f"Successfully opened spreadsheet: {spreadsheet.title}")
+            
+            # Get the specific worksheet by ID if possible, otherwise fall back to the first worksheet
+            try:
+                sheet = None
+                
+                # Try to get the worksheet by ID first
+                if WORKSHEET_ID:
+                    try:
+                        # Try to get worksheet by gid 
+                        worksheets = spreadsheet.worksheets()
+                        for ws in worksheets:
+                            if str(ws.id) == WORKSHEET_ID:
+                                sheet = ws
+                                print(f"Found worksheet by ID {WORKSHEET_ID}: {sheet.title}")
+                                break
+                    except Exception as e:
+                        print(f"Error finding worksheet by ID {WORKSHEET_ID}: {str(e)}")
+                
+                # Fall back to first worksheet if needed
+                if sheet is None:
+                    sheet = spreadsheet.get_worksheet(0)
+                    print(f"Using first worksheet: {sheet.title}")
+            except Exception as e:
+                print(f"Error getting worksheet, falling back to first worksheet: {str(e)}")
+                sheet = spreadsheet.get_worksheet(0)
+                print(f"Using first worksheet: {sheet.title}")
             
             # Get all values from the spreadsheet
             all_values = sheet.get_all_values()
             
             print(f"Retrieved {len(all_values)} rows from the spreadsheet")
+            print(f"Using columns: {', '.join(URL_COLUMNS)}")
             
             # Skip header row (row 1)
             failing_urls = []

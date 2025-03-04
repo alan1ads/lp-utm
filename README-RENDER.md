@@ -29,6 +29,7 @@ Since you'll be deploying to the cloud, you need to convert your `sheetscredenti
 5. Set the name to "url-checker-bot" (or any name you prefer)
 6. Under "Environment Variables", add:
    - `SHEET_URL` = `14Yk8UnQviC29ascf4frQfAEDWzM2_bp1UloRcnW8ZCg` (your Google Sheet ID)
+   - `WORKSHEET_ID` = `1795345169` (the specific worksheet/tab ID to check)
    - `URL_COLUMNS` = `N,O,P,Q,R,S,T,U,V,W,X,Y,Z,AA,AB,AC,AD,AE,AF,AG,AH,AI,AJ,AK,AL,AM,AN,AO,AP,AQ,AR,AS,AT,AU,AV,AW,AX,AY,AZ,BA,BB,BC,BD,BE,BF,BG,BH,BI,BJ,BK,BL`
    - `TESTING_MODE` = `false` (to run daily at 10 AM ET)
    - `GOOGLE_CREDENTIALS` = The entire contents of your `sheetscredentials.json` file (including the curly braces)
@@ -69,4 +70,5 @@ Once you've confirmed everything is working:
 - **Service crashes**: Check logs for errors in the Render.com dashboard
 - **Credentials issues**: Verify that your `GOOGLE_CREDENTIALS` environment variable contains valid JSON
 - **Spreadsheet access problems**: Make sure your service account has been granted access to the spreadsheet
+- **Wrong worksheet**: If the bot is checking the wrong worksheet, verify the `WORKSHEET_ID` parameter matches the gid in your Google Sheets URL
 - **Deployment fails with "No open ports detected"**: Make sure the health check server is working properly (port 10000 should be exposed) 
