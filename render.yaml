@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: url-checker-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: SHEET_URL
+        sync: false
+      - key: URL_COLUMNS
+        sync: false
+      - key: TESTING_MODE
+        sync: false
+      - key: GOOGLE_CREDENTIALS
+        sync: false 
