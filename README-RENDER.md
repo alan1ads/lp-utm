@@ -31,7 +31,7 @@ Since you'll be deploying to the cloud, you need to convert your `sheetscredenti
    - `SHEET_URL` = `14Yk8UnQviC29ascf4frQfAEDWzM2_bp1UloRcnW8ZCg` (your Google Sheet ID)
    - `WORKSHEET_ID` = `1795345169` (the specific worksheet/tab ID to check)
    - `URL_COLUMNS` = `N,O,P,Q,R,S,T,U,V,W,X,Y,Z,AA,AB,AC,AD,AE,AF,AG,AH,AI,AJ,AK,AL,AM,AN,AO,AP,AQ,AR,AS,AT,AU,AV,AW,AX,AY,AZ,BA,BB,BC,BD,BE,BF,BG,BH,BI,BJ,BK,BL`
-   - `TESTING_MODE` = `false` (to run daily at 10 AM ET)
+   - `TESTING_MODE` = `false` (to run daily at 7 AM ET)
    - `GOOGLE_CREDENTIALS` = The entire contents of your `sheetscredentials.json` file (including the curly braces)
 7. Deploy the service
 
@@ -61,7 +61,7 @@ Once you've confirmed everything is working:
 
 1. The bot will wait 2 minutes after deployment to ensure everything is fully initialized
 2. After initialization, the bot will immediately perform an initial check of all URLs
-3. Then it will wait until the next 10 AM Eastern Time to run again
+3. Then it will wait until the next 7 AM Eastern Time to run again
 4. You can monitor the progress in the logs section of your Render dashboard
 5. The bot includes a lightweight health check server on port 10000 to let Render.com know it's running
 

@@ -19,6 +19,9 @@ from gspread_formatting import *
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import traceback
+from urllib.parse import urlparse
+import random
+from time import sleep
 
 # Load environment variables
 load_dotenv()
@@ -61,6 +64,15 @@ CHECK_INTERVAL = 180  # 3 minutes in seconds for testing
 BATCH_SIZE = 500  # Process 500 URLs before restarting the browser
 MAX_BROWSER_LIFETIME = 30  # Maximum minutes to keep a browser instance open
 
+# Add rate limiting constants
+SHEETS_API_WRITES_PER_MINUTE = 60  # Google's quota limit
+RATE_LIMIT_PAUSE_MIN = 60  # Minimum seconds to pause after hitting a rate limit
+RATE_LIMIT_PAUSE_MAX = 90  # Maximum seconds to pause after hitting a rate limit
+RATE_LIMIT_RETRIES = 3    # Maximum retries for rate-limited operations
+
+# Create a queue of cells that need formatting but couldn't be formatted due to rate limits
+pending_formats = []
+
 # Print important configuration for debugging
 print("\n===== CONFIGURATION =====")
 print(f"SHEET_URL: {SHEET_URL}")
@@ -84,53 +96,76 @@ def send_slack_message(message):
         print(f"Error sending Slack message: {e}")
 
 def is_valid_url(url):
-    """Check if string is a valid URL format"""
-    if not url or not isinstance(url, str):
+    """Check if a string is a valid URL format"""
+    try:
+        # Extract domain from URL
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        
+        # URL must have a domain and scheme
+        if not domain:
+            # Some URLs might be domain-only
+            if '.' in url and not url.startswith(('http://', 'https://')):
+                # Try adding a protocol and checking again
+                return is_valid_url('http://' + url)
+            return False
+            
+        # Basic domain validation
+        if '.' not in domain:  # Must have at least one dot in domain
+            return False
+            
+        # URL seems valid
+        return True
+    except:
         return False
 
-    # First check with http:// if it doesn't have a protocol
-    if not url.startswith(('http://', 'https://')):
-        if is_valid_url('http://' + url):
-            return True
-            
-    url_pattern = re.compile(
-        r'^https?://'  # http:// or https://
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain...
-        r'localhost|'  # localhost...
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
-        r'(?::\d+)?'  # optional port
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-    return bool(url_pattern.match(url))
-
 def extract_urls_from_text(text):
-    """Extract valid URLs from text content"""
+    """Extract URLs from text content"""
     if not text or not isinstance(text, str):
         return []
         
-    # Pattern to match URLs with or without protocol
-    url_with_protocol_pattern = re.compile(
-        r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[^"\'\s<>]*)?'
-    )
-    
-    # Pattern to match domains without protocol
-    domain_pattern = re.compile(
-        r'(?<!\S)(?:www\.)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?(?:/?|[/?]\S*)?(?!\S)'
-    )
-    
     urls = []
     
-    # Find URLs with protocol
-    matches = url_with_protocol_pattern.findall(text)
-    for url in matches:
-        if is_valid_url(url):
+    # Common URL patterns with http/https
+    http_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+'
+    
+    # Pattern for domains without protocol (www.example.com or example.com)
+    domain_pattern = r'(?<!\S)(?:www\.)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?(?=\s|$|[,.;:!?)])'
+    
+    # Pattern for IP addresses
+    ip_pattern = r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+    
+    # Find all HTTP/HTTPS URLs
+    http_urls = re.findall(http_pattern, text)
+    for url in http_urls:
+        if url not in urls and is_valid_url(url):
             urls.append(url)
     
-    # Find domains without protocol and add http://
-    matches = domain_pattern.findall(text)
-    for domain in matches:
-        url = 'http://' + domain if not domain.startswith('www.') else 'http://' + domain
-        if is_valid_url(url):
+    # Find all domain-style URLs without protocol
+    domain_urls = re.findall(domain_pattern, text)
+    for domain in domain_urls:
+        url = 'http://' + domain
+        if url not in urls and is_valid_url(url):
             urls.append(url)
+    
+    # Find all IP addresses as potential URLs
+    ip_urls = re.findall(ip_pattern, text)
+    for ip in ip_urls:
+        url = 'http://' + ip
+        if url not in urls and is_valid_url(url):
+            urls.append(url)
+    
+    # Check for the entire text as a potential URL if it looks URL-like
+    if '.' in text and ' ' not in text.strip() and len(text.strip()) > 3:
+        # The entire text might be a URL without protocol
+        if not text.startswith(('http://', 'https://')):
+            potential_url = 'http://' + text.strip()
+            if potential_url not in urls and is_valid_url(potential_url):
+                urls.append(potential_url)
+        else:
+            # Text already has protocol
+            if text not in urls and is_valid_url(text):
+                urls.append(text)
     
     return urls
 
@@ -310,23 +345,101 @@ def analyze_domain_status(content, domain, response_url, title, driver=None):
         print(f"Error in analyze_domain_status: {str(e)}")
         return False, None
 
-def mark_cell_text_red(sheet, row, col):
-    """Mark the cell text as red to indicate a problem with the URL"""
-    cell_range = f"{col}{row}"
-    fmt = CellFormat(
-        textFormat=TextFormat(foregroundColor=Color(1, 0, 0))  # RGB for red
-    )
-    format_cell_range(sheet, cell_range, fmt)
-    print(f"Marked cell {cell_range} as red")
+def mark_cell_text_red(sheet, row, col, retry_count=0, backoff_seconds=1):
+    """Format a cell to have red text to indicate a failed URL"""
+    global pending_formats
+    
+    try:
+        # Get the current cell formatting
+        cell_format = {
+            "textFormat": {
+                "foregroundColor": {
+                    "red": 1.0,
+                    "green": 0.0,
+                    "blue": 0.0
+                }
+            }
+        }
+        
+        # Apply the formatting to the cell
+        format_cell_range(sheet, f'{col}{row}:{col}{row}', cell_format)
+        print(f"Marked cell {col}{row} as red")
+        return True
+    except Exception as e:
+        error_str = str(e)
+        
+        # Check if this is a rate limit error
+        if "RESOURCE_EXHAUSTED" in error_str or "Quota exceeded" in error_str or "429" in error_str:
+            # This is a rate limit error
+            if retry_count < RATE_LIMIT_RETRIES:
+                # Calculate backoff with exponential increase and jitter
+                backoff = min(RATE_LIMIT_PAUSE_MAX, backoff_seconds * 2)
+                jitter = random.uniform(0, backoff / 2)
+                sleep_time = backoff + jitter
+                
+                print(f"⚠️ Rate limit hit when marking cell {col}{row} as red. Pausing for {sleep_time:.1f} seconds (retry {retry_count+1}/{RATE_LIMIT_RETRIES})...")
+                sleep(sleep_time)
+                
+                # Retry with increased backoff
+                return mark_cell_text_red(sheet, row, col, retry_count + 1, backoff)
+            else:
+                # Add to pending formats for later processing
+                print(f"⚠️ Rate limit retries exceeded for cell {col}{row}. Adding to pending formats queue.")
+                pending_formats.append({
+                    'sheet': sheet,
+                    'row': row,
+                    'col': col,
+                    'type': 'red',
+                })
+                return False
+        else:
+            # Some other error
+            print(f"❌ Error marking cell {col}{row} as red: {error_str}")
+            return False
 
-def reset_cell_formatting(sheet, row, col):
+def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
     """Reset cell formatting to bright blue for working URLs"""
-    cell_range = f"{col}{row}"
-    fmt = CellFormat(
-        textFormat=TextFormat(foregroundColor=Color(0.2, 0.6, 1.0))  # RGB for bright blue
-    )
-    format_cell_range(sheet, cell_range, fmt)
-    print(f"Marked cell {cell_range} as bright blue (working URL)")
+    global pending_formats
+    
+    try:
+        cell_range = f"{col}{row}"
+        fmt = CellFormat(
+            textFormat=TextFormat(foregroundColor=Color(0.2, 0.6, 1.0))  # RGB for bright blue
+        )
+        format_cell_range(sheet, cell_range, fmt)
+        print(f"Marked cell {cell_range} as bright blue (working URL)")
+        return True
+    except Exception as e:
+        error_str = str(e)
+        
+        # Check if this is a rate limit error
+        if "RESOURCE_EXHAUSTED" in error_str or "Quota exceeded" in error_str or "429" in error_str:
+            # This is a rate limit error
+            if retry_count < RATE_LIMIT_RETRIES:
+                # Calculate backoff with exponential increase and jitter
+                backoff = min(RATE_LIMIT_PAUSE_MAX, backoff_seconds * 2)
+                jitter = random.uniform(0, backoff / 2)
+                sleep_time = backoff + jitter
+                
+                print(f"⚠️ Rate limit hit when marking cell {col}{row} as blue. Pausing for {sleep_time:.1f} seconds (retry {retry_count+1}/{RATE_LIMIT_RETRIES})...")
+                sleep(sleep_time)
+                
+                # Retry with increased backoff
+                return reset_cell_formatting(sheet, row, col, retry_count + 1, backoff)
+            else:
+                # Add to pending formats for later processing
+                print(f"⚠️ Rate limit retries exceeded for cell {col}{row}. Adding to pending formats queue.")
+                pending_formats.append({
+                    'sheet': sheet,
+                    'row': row,
+                    'col': col,
+                    'type': 'blue',
+                })
+                return False
+        else:
+            # Some other error
+            print(f"❌ Error marking cell {col}{row} as blue: {error_str}")
+            return False
 
 async def check_url(driver, url, sheet, row, col, retry_count=0):
     """Check if a URL is working and mark it in the spreadsheet"""
@@ -335,6 +448,7 @@ async def check_url(driver, url, sheet, row, col, retry_count=0):
     # Track whether the URL is working
     is_working = False
     error_message = ""
+    cell_marked = False  # Flag to track if we've marked the cell
     
     try:
         # Make the actual web request to check the URL
@@ -346,7 +460,7 @@ async def check_url(driver, url, sheet, row, col, retry_count=0):
             if response.status_code >= 400:
                 error_message = f"HTTP Status {response.status_code}"
                 print(f"❌ HTTP Error: {url} - {error_message}")
-                mark_cell_text_red(sheet, row, col)
+                cell_marked = mark_cell_text_red(sheet, row, col)
             else:
                 # URL might be working - analyze content
                 content = response.text
@@ -377,16 +491,16 @@ async def check_url(driver, url, sheet, row, col, retry_count=0):
                 if domain_status == "error":
                     error_message = "Domain error detected"
                     print(f"❌ Domain Error: {url} - {error_message}")
-                    mark_cell_text_red(sheet, row, col)
+                    cell_marked = mark_cell_text_red(sheet, row, col)
                 else:
                     is_working = True
                     print(f"✅ URL is working: {url}")
-                    reset_cell_formatting(sheet, row, col)
+                    cell_marked = reset_cell_formatting(sheet, row, col)
                     
         except requests.exceptions.RequestException as e:
             error_message = str(e)
             print(f"❌ Connection Error: {url} - {error_message}")
-            mark_cell_text_red(sheet, row, col)
+            cell_marked = mark_cell_text_red(sheet, row, col)
     except Exception as e:
         error_message = str(e)
         print(f"❌ Error checking URL: {url} - {error_message}")
@@ -395,7 +509,28 @@ async def check_url(driver, url, sheet, row, col, retry_count=0):
             await asyncio.sleep(2)  # Wait 2 seconds before retry
             return await check_url(driver, url, sheet, row, col, retry_count + 1)
         else:
-            mark_cell_text_red(sheet, row, col)
+            try:
+                cell_marked = mark_cell_text_red(sheet, row, col)
+                if cell_marked:
+                    print(f"Marked cell {col}{row} as red after retry failure")
+                else:
+                    print(f"Failed to mark cell {col}{row} as red after retry failure (likely rate limited)")
+            except Exception as mark_err:
+                print(f"❌ Failed to mark cell {col}{row} as red: {str(mark_err)}")
+
+    # Final safety check - ensure the cell was marked one way or the other
+    if not cell_marked:
+        try:
+            print(f"⚠️ Cell {col}{row} was not marked during processing - added to pending formats queue")
+            pending_formats.append({
+                'sheet': sheet,
+                'row': row,
+                'col': col,
+                'type': 'red' if not is_working else 'blue',
+                'url': url
+            })
+        except Exception as final_mark_err:
+            print(f"❌ Final attempt to track cell {col}{row} failed: {str(final_mark_err)}")
     
     return is_working, error_message
 
@@ -415,6 +550,55 @@ def index_to_column(index):
         column_name = chr(ord('A') + remainder) + column_name
         index = (index - 1) // 26
     return column_name
+
+async def process_pending_formats():
+    """Process any cell formats that couldn't be applied due to rate limits"""
+    global pending_formats
+    
+    if not pending_formats:
+        print("No pending cell formats to process")
+        return
+        
+    print(f"\n===== Processing {len(pending_formats)} pending cell formats =====")
+    
+    # Make a copy of the pending formats and clear the global list
+    formats_to_process = pending_formats.copy()
+    pending_formats = []
+    
+    # Process each pending format with pauses to avoid rate limits
+    for idx, format_data in enumerate(formats_to_process):
+        sheet = format_data['sheet']
+        row = format_data['row']
+        col = format_data['col']
+        format_type = format_data['type']
+        url = format_data.get('url', 'unknown')
+        
+        print(f"Processing pending format {idx+1}/{len(formats_to_process)} for cell {col}{row}: {format_type} (URL: {url})")
+        
+        try:
+            if format_type == 'red':
+                success = mark_cell_text_red(sheet, row, col)
+            else:  # blue
+                success = reset_cell_formatting(sheet, row, col)
+                
+            if not success:
+                # Add back to the pending list if still failed
+                pending_formats.append(format_data)
+                
+            # Pause to avoid hitting rate limits
+            sleep_time = 60 / SHEETS_API_WRITES_PER_MINUTE * 1.5  # 1.5x safety factor
+            print(f"Pausing for {sleep_time:.1f} seconds to avoid rate limits...")
+            await asyncio.sleep(sleep_time)
+            
+        except Exception as e:
+            print(f"❌ Error processing pending format for cell {col}{row}: {str(e)}")
+            pending_formats.append(format_data)
+    
+    remaining = len(pending_formats)
+    if remaining > 0:
+        print(f"⚠️ {remaining} cell formats still pending after processing")
+    else:
+        print("✅ All pending cell formats processed successfully")
 
 async def check_links():
     """Check all URLs in the specified columns of the spreadsheet"""
@@ -460,9 +644,6 @@ async def check_links():
             print(f"Retrieved {len(all_values)} rows from the spreadsheet")
             print(f"Using columns: {', '.join(URL_COLUMNS)}")
             
-            # Skip header row (row 1)
-            row_counter = 2  # Google Sheets is 1-indexed but we're starting with row 2 (after header)
-            
             # Collect all URLs to check
             urls_to_check = []
             
@@ -472,21 +653,64 @@ async def check_links():
             # Loop through all rows to collect URLs
             for row_idx in range(1, len(all_values)):  # Start from index 1 (row 2)
                 row_data = all_values[row_idx]
+                
                 for col_idx in column_indices:
                     # Make sure the row has enough columns
+                    cell_content = ""
                     if col_idx < len(row_data):
-                        cell_value = row_data[col_idx]
-                        if cell_value:
-                            # Extract URLs from the cell
-                            urls = extract_urls_from_text(cell_value)
+                        cell_content = row_data[col_idx]
+                    
+                    if cell_content.strip():  # If cell is not empty
+                        # Extract URLs from the cell
+                        try:
+                            urls = extract_urls_from_text(cell_content)
                             if urls:
                                 # Add to the list of URLs to check
                                 for url in urls:
                                     urls_to_check.append({
                                         'url': url,
                                         'row': row_idx + 1,  # +1 because we're 0-indexed but sheets are 1-indexed
-                                        'col': index_to_column(col_idx)
+                                        'col': index_to_column(col_idx),
+                                        'original_content': cell_content
                                     })
+                            else:
+                                # If no valid URLs found but cell has content, mark it for checking anyway
+                                # It could be a malformed URL that should be marked as invalid
+                                possible_url = cell_content
+                                if not possible_url.startswith(('http://', 'https://')):
+                                    possible_url = 'http://' + possible_url
+                                
+                                urls_to_check.append({
+                                    'url': possible_url,
+                                    'row': row_idx + 1,
+                                    'col': index_to_column(col_idx),
+                                    'original_content': cell_content,
+                                    'is_potential_url': True
+                                })
+                        except Exception as e:
+                            # If URL extraction fails for any reason, mark the cell for checking anyway
+                            print(f"❌ Error extracting URLs from cell {index_to_column(col_idx)}{row_idx+1}: {str(e)}")
+                            try:
+                                # Try to make a checkable URL from the content
+                                possible_url = cell_content
+                                if not possible_url.startswith(('http://', 'https://')):
+                                    possible_url = 'http://' + possible_url
+                                
+                                urls_to_check.append({
+                                    'url': possible_url,
+                                    'row': row_idx + 1,
+                                    'col': index_to_column(col_idx),
+                                    'original_content': cell_content,
+                                    'is_potential_url': True
+                                })
+                            except Exception as inner_e:
+                                print(f"❌ Could not process cell {index_to_column(col_idx)}{row_idx+1}: {str(inner_e)}")
+                                try:
+                                    # Mark as red by default since we can't process it
+                                    mark_cell_text_red(sheet, row_idx + 1, index_to_column(col_idx))
+                                    print(f"Marked problematic cell {index_to_column(col_idx)}{row_idx+1} as red by default")
+                                except Exception as mark_err:
+                                    print(f"❌ Failed to mark problematic cell: {str(mark_err)}")
             
             print(f"Found {len(urls_to_check)} URLs to check")
             
@@ -540,9 +764,19 @@ async def check_links():
                         except Exception as mark_err:
                             print(f"Error marking cell: {str(mark_err)}")
                 
+                # Process any pending cell formats between batches
+                if pending_formats:
+                    print(f"Processing {len(pending_formats)} pending cell formats between batches...")
+                    await process_pending_formats()
+                
                 # Give Google's API a break between batches
                 print(f"Completed batch {batch_count}. Sleeping for 10 seconds to avoid API rate limits...")
                 await asyncio.sleep(10)
+            
+            # Final processing of any remaining pending formats
+            if pending_formats:
+                print(f"Final processing of {len(pending_formats)} pending cell formats...")
+                await process_pending_formats()
             
             # Close the last driver
             if driver:
