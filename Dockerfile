@@ -25,5 +25,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . .
 
+# Expose the port for health checks
+EXPOSE 10000
+
 # Run the bot
 CMD ["python", "url_checker_bot.py"] 

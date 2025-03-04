@@ -62,9 +62,11 @@ Once you've confirmed everything is working:
 2. After initialization, the bot will immediately perform an initial check of all URLs
 3. Then it will wait until the next 10 AM Eastern Time to run again
 4. You can monitor the progress in the logs section of your Render dashboard
+5. The bot includes a lightweight health check server on port 10000 to let Render.com know it's running
 
 ## Troubleshooting
 
 - **Service crashes**: Check logs for errors in the Render.com dashboard
 - **Credentials issues**: Verify that your `GOOGLE_CREDENTIALS` environment variable contains valid JSON
-- **Spreadsheet access problems**: Make sure your service account has been granted access to the spreadsheet 
+- **Spreadsheet access problems**: Make sure your service account has been granted access to the spreadsheet
+- **Deployment fails with "No open ports detected"**: Make sure the health check server is working properly (port 10000 should be exposed) 

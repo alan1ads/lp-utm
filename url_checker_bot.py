@@ -16,6 +16,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from gspread_formatting import *
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Load environment variables
 load_dotenv()
@@ -524,9 +526,34 @@ async def wait_until_next_run():
     print(f"\nWaiting until {target.strftime('%Y-%m-%d %H:%M:%S %Z')} to run next check")
     await asyncio.sleep(wait_seconds)
 
+# Define a simple HTTP server for Render.com health checks
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b'URL Checker Bot is running')
+    
+    def log_message(self, format, *args):
+        # Silence the default logging to keep our console clean
+        return
+
+def start_health_check_server():
+    """Start a simple HTTP server for health checks"""
+    port = int(os.getenv('PORT', 10000))
+    server_address = ('', port)
+    httpd = HTTPServer(server_address, HealthCheckHandler)
+    print(f"Starting health check server on port {port}")
+    httpd.serve_forever()
+
 async def main():
     """Main execution function"""
     print("Starting URL checker service...")
+    
+    # Start the health check server in a separate thread
+    health_check_thread = threading.Thread(target=start_health_check_server, daemon=True)
+    health_check_thread.start()
+    print("Health check server started")
     
     # Give deployment time to stabilize - significantly increased
     startup_delay = 120  # 2 minutes to ensure full deployment
