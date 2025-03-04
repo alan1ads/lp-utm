@@ -528,36 +528,32 @@ async def main():
     """Main execution function"""
     print("Starting URL checker service...")
     
-    # Give deployment time to stabilize
-    startup_delay = 30  # 30 seconds
-    print(f"Waiting {startup_delay} seconds for deployment to stabilize...")
+    # Give deployment time to stabilize - significantly increased
+    startup_delay = 120  # 2 minutes to ensure full deployment
+    print(f"Waiting {startup_delay} seconds for deployment to fully complete...")
     await asyncio.sleep(startup_delay)
     
     print("Service started successfully!")
-    send_slack_message("🚀 URL checker service started - Running initial check...")
+    print("🚀 URL checker service started - Running initial check...")
+    
+    # Always run an immediate check first, regardless of mode
+    print("\nRunning initial URL check...")
+    await check_links()
+    print("Initial check completed.")
     
     # Check if we're in testing mode or production mode
-    testing_mode = os.getenv('TESTING_MODE', 'true').lower() == 'true'
+    testing_mode = os.getenv('TESTING_MODE', 'false').lower() == 'true'
     
     if testing_mode:
         print(f"\nRunning in TESTING mode - checking URLs every {CHECK_INTERVAL} seconds")
-        send_slack_message(f"🧪 Running in TESTING mode - checking URLs every {CHECK_INTERVAL} seconds")
         
         while True:
             print("\nStarting URL check cycle...")
-            await check_links()
             await wait_until_next_interval(CHECK_INTERVAL)
+            await check_links()
     else:
         print("\nRunning in PRODUCTION mode - checking URLs daily at 10 AM Eastern Time")
-        send_slack_message("🔄 Running in PRODUCTION mode - checking URLs daily at 10 AM Eastern Time")
-        
-        # Run an immediate check first
-        print("\nRunning initial URL check...")
-        await check_links()
-        
-        # Then switch to daily schedule
-        print("Initial check completed. Switching to daily schedule.")
-        send_slack_message("✅ Initial check completed. Now waiting for next scheduled check at 10 AM Eastern")
+        print("Now waiting for next scheduled check at 10 AM Eastern")
         
         # Wait for next 10 AM run
         await wait_until_next_run()

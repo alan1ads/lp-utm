@@ -15,7 +15,7 @@ This guide explains how to deploy the URL Checker Bot to Render.com for continuo
 Since you'll be deploying to the cloud, you need to convert your `sheetscredentials.json` file to an environment variable:
 
 1. Open your `sheetscredentials.json` file
-2. Copy all of its contents
+2. Copy all of its contents (the entire JSON, including the curly braces `{}`)
 3. You'll add this as an environment variable in Render.com
 
 ### 2. Deploy to Render.com
@@ -28,10 +28,10 @@ Since you'll be deploying to the cloud, you need to convert your `sheetscredenti
 4. Select "Docker" as the environment
 5. Set the name to "url-checker-bot" (or any name you prefer)
 6. Under "Environment Variables", add:
-   - `SHEET_URL` = Your Google Sheet ID
-   - `URL_COLUMNS` = Comma-separated list of columns to check (e.g., `A,B,C,D,E`)
-   - `TESTING_MODE` = true or false
-   - `GOOGLE_CREDENTIALS` = The entire contents of your `sheetscredentials.json` file (including curly braces)
+   - `SHEET_URL` = `14Yk8UnQviC29ascf4frQfAEDWzM2_bp1UloRcnW8ZCg` (your Google Sheet ID)
+   - `URL_COLUMNS` = `N,O,P,Q,R,S,T,U,V,W,X,Y,Z,AA,AB,AC,AD,AE,AF,AG,AH,AI,AJ,AK,AL,AM,AN,AO,AP,AQ,AR,AS,AT,AU,AV,AW,AX,AY,AZ,BA,BB,BC,BD,BE,BF,BG,BH,BI,BJ,BK,BL`
+   - `TESTING_MODE` = `false` (to run daily at 10 AM ET)
+   - `GOOGLE_CREDENTIALS` = The entire contents of your `sheetscredentials.json` file (including the curly braces)
 7. Deploy the service
 
 #### Option 2: Using render.yaml (Blueprint)
@@ -55,6 +55,13 @@ Once you've confirmed everything is working:
 1. Go to your service in Render.com dashboard
 2. Update the `TESTING_MODE` environment variable to `false`
 3. This will make the bot check URLs daily at 10 AM ET instead of every 3 minutes
+
+### Important Notes About Deployment
+
+1. The bot will wait 2 minutes after deployment to ensure everything is fully initialized
+2. After initialization, the bot will immediately perform an initial check of all URLs
+3. Then it will wait until the next 10 AM Eastern Time to run again
+4. You can monitor the progress in the logs section of your Render dashboard
 
 ## Troubleshooting
 
