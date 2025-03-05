@@ -69,9 +69,12 @@ SHEETS_API_WRITES_PER_MINUTE = 60  # Google's quota limit
 RATE_LIMIT_PAUSE_MIN = 60  # Minimum seconds to pause after hitting a rate limit
 RATE_LIMIT_PAUSE_MAX = 90  # Maximum seconds to pause after hitting a rate limit
 RATE_LIMIT_RETRIES = 3    # Maximum retries for rate-limited operations
+MAX_PENDING_RETRIES = 5   # Maximum retries for processing pending formats
 
 # Create a queue of cells that need formatting but couldn't be formatted due to rate limits
 pending_formats = []
+successfully_formatted_cells = set()  # Track cells that were successfully formatted
+failed_formatted_cells = set()  # Track cells that failed formatting after all retries
 
 # Print important configuration for debugging
 print("\n===== CONFIGURATION =====")
@@ -347,7 +350,13 @@ def analyze_domain_status(content, domain, response_url, title, driver=None):
 
 def mark_cell_text_red(sheet, row, col, retry_count=0, backoff_seconds=1):
     """Format a cell to have red text to indicate a failed URL"""
-    global pending_formats
+    global pending_formats, successfully_formatted_cells, failed_formatted_cells
+    
+    # Check if this cell was already successfully formatted
+    cell_id = f"{col}{row}"
+    if cell_id in successfully_formatted_cells:
+        print(f"Cell {cell_id} was already successfully formatted as red - skipping")
+        return True
     
     try:
         # Get the current cell formatting
@@ -364,6 +373,14 @@ def mark_cell_text_red(sheet, row, col, retry_count=0, backoff_seconds=1):
         # Apply the formatting to the cell
         format_cell_range(sheet, f'{col}{row}:{col}{row}', cell_format)
         print(f"Marked cell {col}{row} as red")
+        
+        # Track this successful formatting
+        successfully_formatted_cells.add(cell_id)
+        
+        # If this was in the failed set, remove it
+        if cell_id in failed_formatted_cells:
+            failed_formatted_cells.remove(cell_id)
+            
         return True
     except Exception as e:
         error_str = str(e)
@@ -385,21 +402,45 @@ def mark_cell_text_red(sheet, row, col, retry_count=0, backoff_seconds=1):
             else:
                 # Add to pending formats for later processing
                 print(f"⚠️ Rate limit retries exceeded for cell {col}{row}. Adding to pending formats queue.")
-                pending_formats.append({
-                    'sheet': sheet,
-                    'row': row,
-                    'col': col,
-                    'type': 'red',
-                })
+                
+                # Create a unique key for this pending format to avoid duplicates
+                format_key = f"{col}{row}:red"
+                # Check if this cell is already in pending_formats with the same type
+                already_pending = False
+                for fmt in pending_formats:
+                    if fmt.get('format_key') == format_key:
+                        already_pending = True
+                        break
+                
+                if not already_pending:
+                    pending_formats.append({
+                        'sheet': sheet,
+                        'row': row,
+                        'col': col,
+                        'type': 'red',
+                        'format_key': format_key,
+                        'retry_count': 0
+                    })
+                else:
+                    print(f"Cell {col}{row} already in pending formats queue")
+                
                 return False
         else:
             # Some other error
             print(f"❌ Error marking cell {col}{row} as red: {error_str}")
+            # Track this failed formatting
+            failed_formatted_cells.add(cell_id)
             return False
 
 def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
     """Reset cell formatting to bright blue for working URLs"""
-    global pending_formats
+    global pending_formats, successfully_formatted_cells, failed_formatted_cells
+    
+    # Check if this cell was already successfully formatted
+    cell_id = f"{col}{row}"
+    if cell_id in successfully_formatted_cells:
+        print(f"Cell {cell_id} was already successfully formatted as blue - skipping")
+        return True
     
     try:
         cell_range = f"{col}{row}"
@@ -408,6 +449,14 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
         )
         format_cell_range(sheet, cell_range, fmt)
         print(f"Marked cell {cell_range} as bright blue (working URL)")
+        
+        # Track this successful formatting
+        successfully_formatted_cells.add(cell_id)
+        
+        # If this was in the failed set, remove it
+        if cell_id in failed_formatted_cells:
+            failed_formatted_cells.remove(cell_id)
+            
         return True
     except Exception as e:
         error_str = str(e)
@@ -429,16 +478,34 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
             else:
                 # Add to pending formats for later processing
                 print(f"⚠️ Rate limit retries exceeded for cell {col}{row}. Adding to pending formats queue.")
-                pending_formats.append({
-                    'sheet': sheet,
-                    'row': row,
-                    'col': col,
-                    'type': 'blue',
-                })
+                
+                # Create a unique key for this pending format to avoid duplicates
+                format_key = f"{col}{row}:blue"
+                # Check if this cell is already in pending_formats with the same type
+                already_pending = False
+                for fmt in pending_formats:
+                    if fmt.get('format_key') == format_key:
+                        already_pending = True
+                        break
+                
+                if not already_pending:
+                    pending_formats.append({
+                        'sheet': sheet,
+                        'row': row,
+                        'col': col,
+                        'type': 'blue',
+                        'format_key': format_key,
+                        'retry_count': 0
+                    })
+                else:
+                    print(f"Cell {col}{row} already in pending formats queue")
+                    
                 return False
         else:
             # Some other error
             print(f"❌ Error marking cell {col}{row} as blue: {error_str}")
+            # Track this failed formatting
+            failed_formatted_cells.add(cell_id)
             return False
 
 async def check_url(driver, url, sheet, row, col, retry_count=0):
@@ -553,17 +620,21 @@ def index_to_column(index):
 
 async def process_pending_formats():
     """Process any cell formats that couldn't be applied due to rate limits"""
-    global pending_formats
+    global pending_formats, successfully_formatted_cells, failed_formatted_cells
     
     if not pending_formats:
         print("No pending cell formats to process")
         return
         
-    print(f"\n===== Processing {len(pending_formats)} pending cell formats =====")
+    total_to_process = len(pending_formats)
+    print(f"\n===== Processing {total_to_process} pending cell formats =====")
     
     # Make a copy of the pending formats and clear the global list
     formats_to_process = pending_formats.copy()
     pending_formats = []
+    
+    successfully_processed = 0
+    still_pending = 0
     
     # Process each pending format with pauses to avoid rate limits
     for idx, format_data in enumerate(formats_to_process):
@@ -571,19 +642,41 @@ async def process_pending_formats():
         row = format_data['row']
         col = format_data['col']
         format_type = format_data['type']
+        format_key = format_data.get('format_key', f"{col}{row}:{format_type}")
+        retry_count = format_data.get('retry_count', 0)
         url = format_data.get('url', 'unknown')
         
-        print(f"Processing pending format {idx+1}/{len(formats_to_process)} for cell {col}{row}: {format_type} (URL: {url})")
+        # Skip if this cell was already successfully formatted
+        cell_id = f"{col}{row}"
+        if cell_id in successfully_formatted_cells:
+            print(f"Skipping pending format {idx+1}/{total_to_process} for cell {cell_id} - already successfully formatted")
+            successfully_processed += 1
+            continue
+            
+        # Check if we've exceeded retries for this cell
+        if retry_count >= MAX_PENDING_RETRIES:
+            print(f"⚠️ Max retries exceeded for cell {cell_id}. Will not attempt further formatting.")
+            failed_formatted_cells.add(cell_id)
+            continue
+        
+        print(f"Processing pending format {idx+1}/{total_to_process} for cell {col}{row}: {format_type} (URL: {url}, retry: {retry_count+1}/{MAX_PENDING_RETRIES})")
         
         try:
+            success = False
             if format_type == 'red':
                 success = mark_cell_text_red(sheet, row, col)
             else:  # blue
                 success = reset_cell_formatting(sheet, row, col)
                 
-            if not success:
-                # Add back to the pending list if still failed
+            if success:
+                successfully_processed += 1
+                print(f"✅ Successfully processed pending format for cell {col}{row}")
+            else:
+                # Add back to the pending list if still failed, with incremented retry count
+                format_data['retry_count'] = retry_count + 1
                 pending_formats.append(format_data)
+                still_pending += 1
+                print(f"⚠️ Failed to process pending format for cell {col}{row} - will retry later")
                 
             # Pause to avoid hitting rate limits
             sleep_time = 60 / SHEETS_API_WRITES_PER_MINUTE * 1.5  # 1.5x safety factor
@@ -592,7 +685,15 @@ async def process_pending_formats():
             
         except Exception as e:
             print(f"❌ Error processing pending format for cell {col}{row}: {str(e)}")
+            format_data['retry_count'] = retry_count + 1
             pending_formats.append(format_data)
+            still_pending += 1
+    
+    print(f"\n===== Pending Formats Processing Summary =====")
+    print(f"✅ Successfully processed: {successfully_processed}/{total_to_process}")
+    print(f"⚠️ Still pending: {still_pending}/{total_to_process}")
+    print(f"Total successfully formatted cells: {len(successfully_formatted_cells)}")
+    print(f"Total failed formatted cells: {len(failed_formatted_cells)}")
     
     remaining = len(pending_formats)
     if remaining > 0:
@@ -777,6 +878,34 @@ async def check_links():
             if pending_formats:
                 print(f"Final processing of {len(pending_formats)} pending cell formats...")
                 await process_pending_formats()
+                
+                # If we still have pending formats, try one more time with a long pause
+                if pending_formats:
+                    print(f"Taking a long pause (120 seconds) before final attempt to process {len(pending_formats)} remaining pending formats...")
+                    await asyncio.sleep(120)
+                    print(f"Final attempt to process {len(pending_formats)} stubborn pending formats...")
+                    await process_pending_formats()
+            
+            # Print final formatting statistics
+            print("\n===== FINAL FORMATTING STATISTICS =====")
+            print(f"Successfully formatted cells: {len(successfully_formatted_cells)}")
+            print(f"Failed to format cells: {len(failed_formatted_cells)}")
+            print(f"Cells still pending formatting: {len(pending_formats)}")
+            
+            if failed_formatted_cells:
+                print("\nThe following cells could not be formatted after all retries:")
+                for cell_id in sorted(list(failed_formatted_cells)):
+                    print(f"- {cell_id}")
+                    
+            if pending_formats:
+                print("\nThe following cells are still pending formatting:")
+                for format_data in pending_formats:
+                    col = format_data['col']
+                    row = format_data['row']
+                    format_type = format_data['type']
+                    print(f"- {col}{row}: {format_type}")
+            
+            print("====================================")
             
             # Close the last driver
             if driver:
