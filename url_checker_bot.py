@@ -561,29 +561,6 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
             print(f"Response status code: {response.status_code}")
             print(f"Final URL after redirects: {response.url}")
             
-            # Simplified check for template variables and placeholders
-            has_template_vars = False
-            response_text_lower = response.text.lower()
-            
-            # Quick template variable check
-            if '{{' in response_text_lower and '}}' in response_text_lower:
-                print(f"⚠️ Found template variables ({{var}}) in content for {url}")
-                has_template_vars = True
-            elif '{' in response_text_lower and '}' in response_text_lower and re.search(r'\{[a-zA-Z0-9_]+\}', response_text_lower):
-                print(f"⚠️ Found placeholder parameters in content for {url}")
-                has_template_vars = True
-                
-            # Quick check for common error terms
-            has_error_terms = False
-            error_terms = ["error", "not found", "404", "403", "forbidden", "expired"]
-            
-            for term in error_terms:
-                if term in response_text_lower:
-                    print(f"⚠️ Found error term '{term}' in content for {url}")
-                    has_error_terms = True
-                    error_message = f"Error content: {term}"
-                    break
-            
             # Check HTTP status code first - quickest determination
             if response.status_code >= 400:
                 error_message = f"HTTP Status {response.status_code}"
@@ -594,23 +571,94 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                     print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
                 return False, error_message
             
-            # For redirects, we trust the final status code but do a quick content check
+            # For redirects, capture the final URL
             final_url = response.url
+            response_text_lower = response.text.lower()
             
-            # Check if we need to use Selenium to verify the page
-            need_selenium_check = (
-                has_template_vars or 
-                has_error_terms or 
-                len(response.text) < 1000 or  # Very short content needs verification
-                '{' in url  # URL contains potential template variables
-            )
+            # Track various indicators for better decision making
+            has_template_vars = False
+            has_error_indicators = False
+            has_parked_domain_indicators = False
+            has_minimal_content = False
+            has_real_content = False
             
-            # Only use Selenium when needed to save time and resources
-            if need_selenium_check:
-                print("Detailed page verification needed - using Selenium")
+            # Check for template variables
+            if '{{' in response_text_lower and '}}' in response_text_lower:
+                print(f"ℹ️ Found handlebars template variables ({{var}}) in content")
+                has_template_vars = True
+            elif '{' in response_text_lower and '}' in response_text_lower and re.search(r'\{[a-zA-Z0-9_]+\}', response_text_lower):
+                print(f"ℹ️ Found curly brace placeholder parameters ({var}) in content")
+                has_template_vars = True
+                
+            # Parse content with BeautifulSoup for deeper analysis
+            try:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Extract important page elements
+                title = soup.find('title')
+                title_text = title.text.strip() if title else "No Title"
+                print(f"Page title: {title_text}")
+                
+                # Get counts of various content elements
+                paragraphs = soup.find_all('p')
+                headings = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+                links = soup.find_all('a')
+                forms = soup.find_all('form')
+                images = soup.find_all('img')
+                
+                # Calculate content density metrics
+                content_elements = len(paragraphs) + len(headings) + len(forms) * 3 + len(images)
+                print(f"Content elements: {content_elements} (paragraphs: {len(paragraphs)}, " +
+                      f"headings: {len(headings)}, forms: {len(forms)}, images: {len(images)})")
+                
+                # Check text content length
+                text_content = soup.get_text()
+                content_length = len(text_content.strip())
+                print(f"Text content length: {content_length} characters")
+                
+                # Analyze content quality
+                if content_elements >= 10 and content_length > 500:
+                    print("✅ Page has substantial content elements and text")
+                    has_real_content = True
+                elif content_elements < 3 and content_length < 200 and not has_template_vars:
+                    print("⚠️ Page has very minimal content")
+                    has_minimal_content = True
+                
+                # Check for specific error phrases - focus on actual error messages
+                error_phrases = [
+                    "404 not found", "403 forbidden", "500 server error", "502 bad gateway",
+                    "dns_probe_finished_nxdomain", "page not found", "site can't be reached",
+                    "connection refused", "site not found", "this page isn't working",
+                    "this site can't be reached", "server not found", "website is unavailable"
+                ]
+                
+                for phrase in error_phrases:
+                    if phrase in response_text_lower:
+                        print(f"❌ Found specific error phrase: '{phrase}'")
+                        has_error_indicators = True
+                        error_message = f"Error content: {phrase}"
+                        break
+                
+                # Check for parked domain indicators
+                parked_domain_phrases = [
+                    "domain is for sale", "buy this domain", "purchase this domain", 
+                    "domain expired", "renew your domain", "this domain may be for sale",
+                    "domain parking", "parked domain", "this web page is parked"
+                ]
+                
+                for phrase in parked_domain_phrases:
+                    if phrase in response_text_lower:
+                        print(f"⚠️ Found parked domain indicator: '{phrase}'")
+                        has_parked_domain_indicators = True
+                        error_message = f"Parked domain: {phrase}"
+                        break
+                
+                # Always check with Selenium for a more accurate assessment
+                # Especially important for JS-heavy sites and landing pages
+                print("Performing thorough rendering check with Selenium")
                 try:
                     # Add error handling for tab crashes
-                    max_selenium_retries = 2  # Try up to 2 times with Selenium
+                    max_selenium_retries = 2
                     selenium_attempt = 0
                     
                     while selenium_attempt < max_selenium_retries:
@@ -619,45 +667,111 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                             print(f"Loading URL in Selenium (attempt {selenium_attempt+1}): {original_url}")
                             driver.get(original_url)
                             
-                            # Shorter wait time to speed up processing
-                            WebDriverWait(driver, 12).until(
+                            # Wait for page to load with longer timeout (15 seconds)
+                            WebDriverWait(driver, 15).until(
                                 EC.presence_of_element_located((By.TAG_NAME, "body"))
                             )
                             
-                            # Check for serious errors in rendered page
+                            # Analyze the rendered page
                             page_source = driver.page_source.lower()
-                            rendered_error = False
+                            rendered_body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
                             
-                            for indicator in ["error", "not found", "404", "403", "can't be reached"]:
-                                if indicator in page_source:
-                                    print(f"Found error indicator '{indicator}' in rendered content")
-                                    rendered_error = True
-                                    error_message = f"Rendered error: {indicator}"
+                            # Check for error indicators in the rendered content
+                            selenium_error_found = False
+                            for phrase in error_phrases:
+                                if phrase in rendered_body_text:
+                                    print(f"❌ Found error phrase in rendered content: '{phrase}'")
+                                    selenium_error_found = True
+                                    error_message = f"Rendered error: {phrase}"
                                     break
-                            
-                            if rendered_error:
+                                    
+                            # Check for parked domain indicators in the rendered content
+                            selenium_parked_found = False
+                            for phrase in parked_domain_phrases:
+                                if phrase in rendered_body_text:
+                                    print(f"⚠️ Found parked domain indicator in rendered content: '{phrase}'")
+                                    selenium_parked_found = True
+                                    error_message = f"Rendered parked domain: {phrase}"
+                                    break
+                                    
+                            # If Selenium found clear errors, mark the page as not working
+                            if selenium_error_found or selenium_parked_found:
+                                has_error_indicators = selenium_error_found
+                                has_parked_domain_indicators = selenium_parked_found
                                 if is_last_url:
                                     cell_marked = mark_cell_text_red(sheet, row, col)
                                 else:
                                     print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
                                 return False, error_message
                             
-                            # Check for minimal content
-                            text_content = driver.find_element(By.TAG_NAME, "body").text
+                            # Analyze interactive elements in rendered page
+                            rendered_paragraphs = len(driver.find_elements(By.TAG_NAME, "p"))
+                            rendered_headings = len(driver.find_elements(By.CSS_SELECTOR, "h1, h2, h3, h4, h5, h6"))
+                            rendered_forms = len(driver.find_elements(By.TAG_NAME, "form"))
+                            rendered_buttons = len(driver.find_elements(By.TAG_NAME, "button"))
+                            rendered_inputs = len(driver.find_elements(By.TAG_NAME, "input"))
+                            rendered_images = len(driver.find_elements(By.TAG_NAME, "img"))
                             
-                            if len(text_content.strip()) < 50:
-                                print(f"⚠️ Very little text content found on page: {len(text_content.strip())} chars")
-                                if is_last_url:
-                                    cell_marked = mark_cell_text_red(sheet, row, col)
-                                else:
-                                    print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
-                                return False, "Empty or minimal content page"
+                            print(f"Rendered content: {rendered_paragraphs} paragraphs, " +
+                                  f"{rendered_headings} headings, {rendered_forms} forms, " + 
+                                  f"{rendered_buttons} buttons, {rendered_inputs} inputs, " +
+                                  f"{rendered_images} images")
                             
-                            # If we get here without exceptions, break the retry loop
-                            print(f"✅ Selenium verification passed for {url}")
-                            is_working = True
+                            # Evaluate content quality
+                            rendered_text_length = len(rendered_body_text.strip())
+                            print(f"Rendered text length: {rendered_text_length} characters")
+                            
+                            has_interactive_elements = rendered_forms > 0 or rendered_buttons > 0 or rendered_inputs > 0
+                            
+                            # Calculate a content quality score
+                            content_quality = (
+                                rendered_paragraphs + 
+                                (rendered_headings * 2) + 
+                                (rendered_forms * 3) + 
+                                rendered_buttons + 
+                                rendered_inputs + 
+                                (rendered_images * 0.5)
+                            )
+                            
+                            print(f"Content quality score: {content_quality}")
+                            
+                            # Make landing page specific assessments
+                            is_landing_page = has_interactive_elements and "{{" in url
+                            is_working_landing_page = False
+                            
+                            # Special case for landing pages with template variables
+                            if is_landing_page:
+                                print("This appears to be a landing page with template variables")
+                                # Landing pages with forms are typically functional despite template vars
+                                if rendered_forms > 0 or (rendered_buttons > 0 and rendered_inputs > 0):
+                                    print("✅ Landing page has functional form elements")
+                                    is_working_landing_page = True
+                                # Landing pages often have minimal text content due to their nature
+                                if content_quality >= 5:
+                                    print("✅ Landing page has sufficient quality score")
+                                    is_working_landing_page = True
+                            
+                            # Regular page assessment
+                            if content_quality >= 8 or has_real_content:
+                                print("✅ Page has high quality content")
+                                is_working = True
+                            elif is_working_landing_page:
+                                print("✅ Working landing page detected")
+                                is_working = True
+                            elif rendered_text_length < 50 and content_quality < 3 and not has_interactive_elements:
+                                print("⚠️ Page has extremely minimal content and no interactive elements")
+                                has_minimal_content = True
+                                if not is_landing_page:
+                                    # Empty pages without interactive elements are probably errors
+                                    error_message = "Empty or minimal content page"
+                            else:
+                                # Default to working if we passed all error checks and the HTTP status was 200
+                                print("ℹ️ Page passed basic content checks with HTTP 200")
+                                is_working = True
+                                
+                            # Success - break out of retry loop
                             break
-                            
+                                
                         except Exception as selenium_error:
                             selenium_attempt += 1
                             error_str = str(selenium_error)
@@ -675,40 +789,61 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                                     
                                     # If this is our last retry and it failed, use request success as fallback
                                     if selenium_attempt >= max_selenium_retries - 1:
-                                        print("Max Selenium retries reached after tab crash. Falling back to request result.")
-                                        # Since the HTTP request was successful, consider the URL working
-                                        is_working = True
+                                        print("Max Selenium retries reached after tab crash. Falling back to request analysis.")
+                                        # Fall back to request-based analysis
+                                        is_working = not (has_error_indicators or has_parked_domain_indicators) and content_elements > 0
                                         break
                                 except Exception as restart_error:
                                     print(f"Error restarting browser: {restart_error}")
                             
                             # If this is our last retry with Selenium, use HTTP request result as fallback
                             if selenium_attempt >= max_selenium_retries:
-                                print("Max Selenium retries reached. Falling back to request result.")
-                                # Since the HTTP request was successful, consider the URL working
-                                is_working = True
+                                print("Max Selenium retries reached. Falling back to request analysis.")
+                                # Fall back to request-based analysis
+                                is_working = not (has_error_indicators or has_parked_domain_indicators) and content_elements > 0
                             else:
                                 # Pause before next attempt
                                 await asyncio.sleep(3)
                     
-                    # If we've tried the maximum Selenium retries and still had errors,
-                    # use the HTTP response as a fallback check
+                    # If we exited the loop due to max retries but haven't set a status,
+                    # make the final determination based on combined factors
                     if selenium_attempt >= max_selenium_retries and not is_working:
-                        print("Selenium verification failed. Using HTTP request result as fallback.")
-                        # If HTTP request was successful (we already checked status code above),
-                        # consider the URL working
-                        is_working = True
+                        if has_error_indicators or has_parked_domain_indicators:
+                            print("❌ URL has clear error or parked domain indicators from request analysis")
+                            is_working = False
+                        elif has_minimal_content and not is_landing_page:
+                            print("⚠️ URL has minimal content and is not a landing page")
+                            is_working = False
+                        else:
+                            # Default to working if HTTP status was good
+                            print("ℹ️ Defaulting to working status based on HTTP 200 response")
+                            is_working = True
+                        
                 except Exception as outer_selenium_error:
                     print(f"❌ Outer Selenium check failed: {str(outer_selenium_error)}")
-                    # Don't automatically fail - since HTTP request was successful,
-                    # consider the URL working despite Selenium issues
-                    is_working = True
-            else:
-                # No need for Selenium check, URL seems good
-                print(f"✅ Basic checks passed for {url}, no need for detailed verification")
-                is_working = True
+                    # Fall back to request analysis
+                    if has_error_indicators or has_parked_domain_indicators:
+                        print("❌ URL has clear error or parked domain indicators from request analysis")
+                        is_working = False
+                    elif has_minimal_content and not has_template_vars:
+                        print("⚠️ URL has minimal content and no template variables")
+                        is_working = False
+                    else:
+                        # Default to working if HTTP status was good (but with a warning)
+                        print("⚠️ Defaulting to working status based on HTTP 200 response (with caution)")
+                        is_working = True
+                
+            except Exception as bs_error:
+                print(f"Error parsing content: {bs_error}")
+                # If we can't parse the content but HTTP status was 200, consider it working
+                # unless we found clear error indicators in the raw text
+                is_working = response.status_code < 400 and "404" not in response_text_lower
             
-            # Mark the cell based on our findings
+            # Final decision based on all collected evidence
+            if has_error_indicators or has_parked_domain_indicators:
+                is_working = False
+                
+            # Mark the cell based on our decision
             if is_working:
                 print(f"✅ URL is working: {url}")
                 if is_last_url:
@@ -716,6 +851,7 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                 else:
                     print(f"Not marking cell blue yet since this is not the last URL in cell {col}{row}")
             else:
+                error_message = error_message or "Failed content quality checks"
                 print(f"❌ URL is not working properly: {url} - {error_message}")
                 if is_last_url:
                     cell_marked = mark_cell_text_red(sheet, row, col)
@@ -723,7 +859,7 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                     print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
                     
         except requests.exceptions.RequestException as e:
-            # For connection errors, try a fallback check with Selenium
+            # Connection errors are handled via Selenium fallback
             error_message = str(e)
             print(f"❌ Connection Error with requests: {url} - {error_message}")
             
@@ -737,12 +873,28 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                 
                 # If we got here, the page loaded in Selenium despite the request error
                 print(f"✅ Selenium fallback succeeded for {url} despite request error")
-                is_working = True
                 
-                if is_last_url:
-                    cell_marked = reset_cell_formatting(sheet, row, col)
+                # Do a quick content check
+                rendered_text = driver.find_element(By.TAG_NAME, "body").text
+                if len(rendered_text.strip()) > 100:
+                    print("✅ Selenium found reasonable content despite request error")
+                    is_working = True
                 else:
-                    print(f"Not marking cell blue yet since this is not the last URL in cell {col}{row}")
+                    print("⚠️ Page loaded in Selenium but has minimal content")
+                    # For landing pages, minimal content might be valid
+                    if "{{" in url or "{" in url:
+                        print("ℹ️ Minimal content might be valid for landing page with template variables")
+                        is_working = True
+                    else:
+                        is_working = False
+                        error_message = "Minimal content despite successful load"
+                
+                if is_working and is_last_url:
+                    cell_marked = reset_cell_formatting(sheet, row, col)
+                elif not is_working and is_last_url:
+                    cell_marked = mark_cell_text_red(sheet, row, col)
+                else:
+                    print(f"Not marking cell yet since this is not the last URL in cell {col}{row}")
             except Exception as selenium_error:
                 # If both requests and Selenium fail, the URL is definitely not working
                 print(f"❌ Both requests and Selenium failed for {url}")
@@ -826,7 +978,7 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
     return is_working, error_message
 
 def column_to_index(column_name):
-    """Convert a column name (A, B, C, ..., Z, AA, AB, etc.) to a 0-based index"""
+    """Convert column name (A, B, C, ..., AA, AB, etc.) to 0-based index"""
     index = 0
     for char in column_name:
         index = index * 26 + (ord(char) - ord('A') + 1)
