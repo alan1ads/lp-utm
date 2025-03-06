@@ -61,22 +61,34 @@ URL_COLUMNS = os.getenv('URL_COLUMNS', 'N,O,P,Q,R,S,T,U,V,W,X,Y,Z,AA,AB,AC,AD,AE
 CHECK_INTERVAL = 180  # 3 minutes in seconds for testing
 
 # Constants for batch processing
-BATCH_SIZE = 500  # Process 500 URLs before restarting the browser
-MAX_BROWSER_LIFETIME = 30  # Maximum minutes to keep a browser instance open
+BATCH_SIZE = 300  # Process URLs in batches of 300 (reduced from 500)
+MAX_BROWSER_LIFETIME = 20  # Restart browser every 20 minutes (reduced from 30)
 
 # Add rate limiting constants
 SHEETS_API_WRITES_PER_MINUTE = 60  # Google's quota limit
-RATE_LIMIT_PAUSE_MIN = 180  # Minimum seconds to pause after hitting a rate limit (greatly increased)
-RATE_LIMIT_PAUSE_MAX = 300  # Maximum seconds to pause after hitting a rate limit (greatly increased)
+RATE_LIMIT_PAUSE_MIN = 180  # Minimum seconds to pause after hitting a rate limit
+RATE_LIMIT_PAUSE_MAX = 300  # Maximum seconds to pause after hitting a rate limit
 RATE_LIMIT_RETRIES = 5      # Maximum retries for rate-limited operations
-MAX_PENDING_RETRIES = 10    # Maximum retries for processing pending formats (increased)
-BATCH_WRITE_SIZE = 5        # Process this many pending formats at a time (smaller batches)
-BATCH_WRITE_PAUSE = 180     # Seconds to pause between batches of pending formats (longer pauses)
+MAX_PENDING_RETRIES = 10    # Maximum retries for processing pending formats
+BATCH_WRITE_SIZE = 5        # Process 5 pending formats at a time
+BATCH_WRITE_PAUSE = 180     # Pause 180 seconds between pending format batches
+INTER_URL_PAUSE = 0.5       # Pause 0.5 seconds between individual URL checks
+BATCH_COMPLETION_PAUSE = 60 # Pause 60 seconds between URL checking batches
 
-# Create a queue of cells that need formatting but couldn't be formatted due to rate limits
+# Browser management
+browser_restart_count = 0  # Track browser restarts
+
+# Time constants
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86400
+
+# Global tracking sets for cell formatting
+successfully_formatted_cells = set()
+failed_formatted_cells = set()
+
+# List to track pending cell formats
 pending_formats = []
-successfully_formatted_cells = set()  # Track cells that were successfully formatted
-failed_formatted_cells = set()  # Track cells that failed formatting after all retries
 
 # Print important configuration for debugging
 print("\n===== CONFIGURATION =====")
@@ -125,54 +137,31 @@ def is_valid_url(url):
         return False
 
 def extract_urls_from_text(text):
-    """Extract URLs from text content"""
-    if not text or not isinstance(text, str):
+    """Extract URLs from text (preserving full URL structure including query parameters)"""
+    if not text:
         return []
+    
+    # Use a URL pattern that includes query parameters and fragments
+    url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[^/\s]*)*(?:\?[^\s]*)?(?:#[^\s]*)?'
+    matches = re.findall(url_pattern, text)
+    
+    # Filter out invalid URLs but preserve full structure
+    valid_urls = []
+    for url in matches:
+        # Clean the URL (remove trailing punctuation but keep query parameters)
+        url = url.strip()
+        # Remove trailing punctuation but preserve query parameters
+        if url.endswith(('.', ',', ')', ']', '}', ':', ';')):
+            url = url[:-1]
         
-    urls = []
+        if is_valid_url(url):
+            valid_urls.append(url)
     
-    # Common URL patterns with http/https
-    http_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+'
+    # Log extracted URLs
+    if valid_urls:
+        print(f"Extracted {len(valid_urls)} valid URLs: {valid_urls}")
     
-    # Pattern for domains without protocol (www.example.com or example.com)
-    domain_pattern = r'(?<!\S)(?:www\.)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?(?=\s|$|[,.;:!?)])'
-    
-    # Pattern for IP addresses
-    ip_pattern = r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
-    
-    # Find all HTTP/HTTPS URLs
-    http_urls = re.findall(http_pattern, text)
-    for url in http_urls:
-        if url not in urls and is_valid_url(url):
-            urls.append(url)
-    
-    # Find all domain-style URLs without protocol
-    domain_urls = re.findall(domain_pattern, text)
-    for domain in domain_urls:
-        url = 'http://' + domain
-        if url not in urls and is_valid_url(url):
-            urls.append(url)
-    
-    # Find all IP addresses as potential URLs
-    ip_urls = re.findall(ip_pattern, text)
-    for ip in ip_urls:
-        url = 'http://' + ip
-        if url not in urls and is_valid_url(url):
-            urls.append(url)
-    
-    # Check for the entire text as a potential URL if it looks URL-like
-    if '.' in text and ' ' not in text.strip() and len(text.strip()) > 3:
-        # The entire text might be a URL without protocol
-        if not text.startswith(('http://', 'https://')):
-            potential_url = 'http://' + text.strip()
-            if potential_url not in urls and is_valid_url(potential_url):
-                urls.append(potential_url)
-        else:
-            # Text already has protocol
-            if text not in urls and is_valid_url(text):
-                urls.append(text)
-    
-    return urls
+    return valid_urls
 
 def get_domain_expiration_indicators():
     """Get common patterns that indicate an expired domain"""
@@ -351,20 +340,26 @@ def analyze_domain_status(content, domain, response_url, title, driver=None):
         return False, None
 
 def mark_cell_text_red(sheet, row, col, retry_count=0, backoff_seconds=1):
-    """Mark cell text as red to indicate failing URL"""
+    """Mark cell text as red for failed URLs"""
     global pending_formats, successfully_formatted_cells, failed_formatted_cells
     
-    # Check if this cell was already successfully formatted
+    # Get the unique cell identifier
     cell_id = f"{col}{row}"
-    if cell_id in successfully_formatted_cells:
-        print(f"Cell {cell_id} was already successfully formatted as red - skipping")
+    
+    # For marking RED, we'll still skip if already marked red to avoid unnecessary API calls.
+    # But if a cell is currently blue (in successfully_formatted_cells), we SHOULD mark it red
+    # if a bad URL is found after a good one.
+    if cell_id in failed_formatted_cells and cell_id not in successfully_formatted_cells:
+        print(f"Cell {cell_id} was already marked red - skipping")
         return True
     
     try:
+        # Define the cell range for formatting
         cell_range = f"{col}{row}"
+        
         # FIX: Create CellFormat properly with a new instance each time
         fmt = CellFormat(
-            textFormat=TextFormat(foregroundColor=Color(1, 0, 0))  # RGB for red
+            textFormat=TextFormat(foregroundColor=Color(0.95, 0.2, 0.1))  # Red
         )
         
         # Debug output to help diagnose issues
@@ -375,76 +370,83 @@ def mark_cell_text_red(sheet, row, col, retry_count=0, backoff_seconds=1):
         print(f"Marked cell {cell_range} as red (failed URL)")
         
         # Track this successful formatting
-        successfully_formatted_cells.add(cell_id)
+        failed_formatted_cells.add(cell_id)
         
-        # If this was in the failed set, remove it
-        if cell_id in failed_formatted_cells:
-            failed_formatted_cells.remove(cell_id)
+        # If this was in the successfully formatted set, remove it as it's now failed
+        if cell_id in successfully_formatted_cells:
+            successfully_formatted_cells.remove(cell_id)
             
         return True
     except Exception as e:
         error_str = str(e)
         
-        # Check if this is a rate limit error
-        if "RESOURCE_EXHAUSTED" in error_str or "Quota exceeded" in error_str or "429" in error_str:
-            # This is a rate limit error
+        # Check for rate limit errors
+        if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str or "quota" in error_str.lower():
+            print(f"⚠️ Rate limit hit while marking cell {cell_range} as red")
             if retry_count < RATE_LIMIT_RETRIES:
-                # Calculate backoff with exponential increase and jitter
-                sleep_time = min(RATE_LIMIT_PAUSE_MAX, backoff_seconds + random.uniform(1, 20))
-                print(f"🕒 Rate limit hit marking cell {col}{row} as red. Retrying after {sleep_time:.1f} seconds (attempt {retry_count+1}/{RATE_LIMIT_RETRIES})...")
-                time.sleep(sleep_time)  # Use blocking sleep within this function
-                # Recursive retry with increased backoff
-                return mark_cell_text_red(sheet, row, col, retry_count + 1, backoff_seconds * 2)
-            else:
-                # Max retries reached, add to pending queue
-                print(f"⚠️ Max retries reached for cell {col}{row}. Adding to pending formats queue.")
-                pending_formats.append({
-                    'sheet': sheet,
-                    'row': row,
-                    'col': col,
-                    'type': 'red',
-                    'format_key': f"{col}{row}:red",
-                    'retry_count': 0,
-                    'url': 'unknown'
-                })
-                return False
-        elif "to_props" in error_str:
-            # Specific fix for the 'dict' object has no attribute 'to_props' error
-            print(f"⚠️ CellFormat error for cell {col}{row}. Trying alternative method...")
-            try:
-                # Try an alternative approach without using the CellFormat object directly
-                sheet.format(cell_range, {"textFormat": {"foregroundColor": {"red": 1, "green": 0, "blue": 0}}})
-                print(f"✅ Successfully marked cell {cell_range} as red using alternative method")
-                successfully_formatted_cells.add(cell_id)
-                return True
-            except Exception as alt_e:
-                print(f"❌ Alternative method also failed for cell {col}{row}: {str(alt_e)}")
-                # Add to pending for later retry with escalated priority
-                pending_formats.append({
-                    'sheet': sheet,
-                    'row': row,
-                    'col': col,
-                    'type': 'red',
-                    'format_key': f"{col}{row}:red",
-                    'retry_count': MAX_PENDING_RETRIES - 2,  # High priority retry
-                    'url': 'unknown'
-                })
-                failed_formatted_cells.add(cell_id)
-                return False
-        else:
-            # Some other error
-            print(f"❌ Error marking cell {col}{row} as red: {error_str}")
-            # Track this failed formatting
+                # Calculate exponential backoff with jitter
+                jitter = random.uniform(0.5, 1.5)
+                retry_seconds = min(backoff_seconds * (2 ** retry_count) * jitter, RATE_LIMIT_PAUSE_MAX)
+                print(f"Retrying in {retry_seconds:.1f} seconds (retry {retry_count+1}/{RATE_LIMIT_RETRIES})")
+                time.sleep(retry_seconds)
+                return mark_cell_text_red(sheet, row, col, retry_count + 1, backoff_seconds)
+            
+            # Add to pending formats to retry later
+            print(f"Maximum retries reached for cell {cell_range}. Adding to pending formats queue.")
+            pending_formats.append({
+                'sheet': sheet,
+                'row': row,
+                'col': col,
+                'type': 'red',
+                'format_key': f"{col}{row}:red"
+            })
             failed_formatted_cells.add(cell_id)
             return False
+        
+        # Check for the 'to_props' error
+        elif "'dict' object has no attribute 'to_props'" in error_str:
+            print(f"⚠️ Encountered 'to_props' error - trying alternative formatting method")
+            try:
+                # Try alternative formatting method
+                worksheet = sheet
+                worksheet.format(cell_range, {
+                    "textFormat": {
+                        "foregroundColor": {
+                            "red": 0.95,
+                            "green": 0.2,
+                            "blue": 0.1
+                        }
+                    }
+                })
+                print(f"Marked cell {cell_range} as red using alternative method")
+                
+                # Track successful formatting
+                failed_formatted_cells.add(cell_id)
+                if cell_id in successfully_formatted_cells:
+                    successfully_formatted_cells.remove(cell_id)
+                    
+                return True
+            except Exception as inner_e:
+                print(f"❌ Alternative formatting method also failed: {str(inner_e)}")
+                failed_formatted_cells.add(cell_id)
+                return False
+        
+        print(f"❌ Error marking cell {cell_range} as red: {error_str}")
+        # Track this failed formatting
+        failed_formatted_cells.add(cell_id)
+        return False
 
 def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
     """Reset cell formatting to bright blue for working URLs"""
     global pending_formats, successfully_formatted_cells, failed_formatted_cells
     
-    # Check if this cell was already successfully formatted
+    # Get the unique cell identifier
     cell_id = f"{col}{row}"
-    if cell_id in successfully_formatted_cells:
+    
+    # IMPORTANT CHANGE: We will NOT skip formatting even if the cell was already formatted.
+    # This allows changing from red to blue if a working URL is found after a non-working one.
+    # Instead, check if it's already blue (to avoid unnecessary API calls)
+    if cell_id in successfully_formatted_cells and cell_id not in failed_formatted_cells:
         print(f"Cell {cell_id} was already successfully formatted as blue - skipping")
         return True
     
@@ -473,249 +475,282 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
     except Exception as e:
         error_str = str(e)
         
-        # Check if this is a rate limit error
-        if "RESOURCE_EXHAUSTED" in error_str or "Quota exceeded" in error_str or "429" in error_str:
-            # This is a rate limit error
+        # Check for rate limit errors
+        if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str or "quota" in error_str.lower():
+            print(f"⚠️ Rate limit hit while marking cell {cell_range} as blue")
             if retry_count < RATE_LIMIT_RETRIES:
-                # Calculate backoff with exponential increase and jitter
-                sleep_time = min(RATE_LIMIT_PAUSE_MAX, backoff_seconds + random.uniform(1, 20))
-                print(f"🕒 Rate limit hit marking cell {col}{row} as blue. Retrying after {sleep_time:.1f} seconds (attempt {retry_count+1}/{RATE_LIMIT_RETRIES})...")
-                time.sleep(sleep_time)  # Use blocking sleep within this function
-                # Recursive retry with increased backoff
-                return reset_cell_formatting(sheet, row, col, retry_count + 1, backoff_seconds * 2)
-            else:
-                # Max retries reached, add to pending queue
-                print(f"⚠️ Max retries reached for cell {col}{row}. Adding to pending formats queue.")
-                pending_formats.append({
-                    'sheet': sheet,
-                    'row': row,
-                    'col': col,
-                    'type': 'blue',
-                    'format_key': f"{col}{row}:blue",
-                    'retry_count': 0,
-                    'url': 'unknown'
-                })
-                return False
-        elif "to_props" in error_str:
-            # Specific fix for the 'dict' object has no attribute 'to_props' error
-            print(f"⚠️ CellFormat error for cell {col}{row}. Trying alternative method...")
-            try:
-                # Try an alternative approach without using the CellFormat object directly
-                sheet.format(cell_range, {"textFormat": {"foregroundColor": {"red": 0.2, "green": 0.6, "blue": 1.0}}})
-                print(f"✅ Successfully marked cell {cell_range} as blue using alternative method")
-                successfully_formatted_cells.add(cell_id)
-                return True
-            except Exception as alt_e:
-                print(f"❌ Alternative method also failed for cell {col}{row}: {str(alt_e)}")
-                # Add to pending for later retry with escalated priority
-                pending_formats.append({
-                    'sheet': sheet,
-                    'row': row,
-                    'col': col,
-                    'type': 'blue',
-                    'format_key': f"{col}{row}:blue",
-                    'retry_count': MAX_PENDING_RETRIES - 2,  # High priority retry
-                    'url': 'unknown'
-                })
-                failed_formatted_cells.add(cell_id)
-                return False
-        else:
-            # Some other error
-            print(f"❌ Error marking cell {col}{row} as blue: {error_str}")
-            # Track this failed formatting
+                # Calculate exponential backoff with jitter
+                jitter = random.uniform(0.5, 1.5)
+                retry_seconds = min(backoff_seconds * (2 ** retry_count) * jitter, RATE_LIMIT_PAUSE_MAX)
+                print(f"Retrying in {retry_seconds:.1f} seconds (retry {retry_count+1}/{RATE_LIMIT_RETRIES})")
+                time.sleep(retry_seconds)
+                return reset_cell_formatting(sheet, row, col, retry_count + 1, backoff_seconds)
+                
+            # Add to pending formats to retry later
+            print(f"Maximum retries reached for cell {cell_range}. Adding to pending formats queue.")
+            pending_formats.append({
+                'sheet': sheet,
+                'row': row,
+                'col': col,
+                'type': 'blue',
+                'format_key': f"{col}{row}:blue"
+            })
             failed_formatted_cells.add(cell_id)
             return False
+            
+        # Check for the 'to_props' error
+        elif "'dict' object has no attribute 'to_props'" in error_str:
+            print(f"⚠️ Encountered 'to_props' error - trying alternative formatting method")
+            try:
+                # Try alternative formatting method
+                worksheet = sheet
+                worksheet.format(cell_range, {
+                    "textFormat": {
+                        "foregroundColor": {
+                            "red": 0.2,
+                            "green": 0.6,
+                            "blue": 1.0
+                        }
+                    }
+                })
+                print(f"Marked cell {cell_range} as blue using alternative method")
+                
+                # Track successful formatting
+                successfully_formatted_cells.add(cell_id)
+                if cell_id in failed_formatted_cells:
+                    failed_formatted_cells.remove(cell_id)
+                    
+                return True
+            except Exception as inner_e:
+                print(f"❌ Alternative formatting method also failed: {str(inner_e)}")
+                failed_formatted_cells.add(cell_id)
+                return False
+                
+        print(f"❌ Error marking cell {cell_range} as blue: {error_str}")
+        # Track this failed formatting
+        failed_formatted_cells.add(cell_id)
+        return False
 
-async def check_url(driver, url, sheet, row, col, retry_count=0):
+async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=False):
     """Check if a URL is working and mark it in the spreadsheet"""
-    print(f"=== Checking URL: {url} at cell {col}{row} ===")
+    global browser_restart_count
+    
+    print(f"=== Checking URL: {url} at cell {col}{row} {'(FINAL URL in cell)' if is_last_url else ''} ===")
     
     # Track whether the URL is working
     is_working = False
     error_message = ""
     cell_marked = False  # Flag to track if we've marked the cell
+    original_url = url  # Store the original URL for reference
     
     try:
         # Make the actual web request to check the URL
         try:
-            timeout = 30  # Increased timeout to 30 seconds like in the original code
+            timeout = 30  # Increased timeout to 30 seconds
             
-            # Add proper headers like in the original code
+            # Use proper headers to simulate a real browser
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
+            
+            # Print the full URL we're checking (including query parameters)
+            print(f"Checking full URL: {url}")
             
             response = requests.get(url, timeout=timeout, allow_redirects=True, headers=headers)
             
             print(f"Response status code: {response.status_code}")
             print(f"Final URL after redirects: {response.url}")
             
-            # Check for special error conditions from the original code
-            has_special_error = False
+            # Simplified check for template variables and placeholders
+            has_template_vars = False
             response_text_lower = response.text.lower()
             
-            # Check for Error 1000 or DNS errors in content
-            if "error 1000" in response_text_lower:
-                print(f"Found Error 1000 in response content for {url}")
-                has_special_error = True
-                error_message = "Cloudflare Error 1000"
-            elif "dns points to prohibited ip" in response_text_lower and "cloudflare" in response_text_lower:
-                print(f"Found Cloudflare Error 1000 indicators in response content for {url}")
-                has_special_error = True
-                error_message = "Cloudflare DNS Error"
-            elif "dns_probe_finished_nxdomain" in response_text_lower:
-                print(f"Found DNS_PROBE_FINISHED_NXDOMAIN in response content for {url}")
-                has_special_error = True
-                error_message = "DNS Probe Finished NXDOMAIN"
+            # Quick template variable check
+            if '{{' in response_text_lower and '}}' in response_text_lower:
+                print(f"⚠️ Found template variables ({{var}}) in content for {url}")
+                has_template_vars = True
+            elif '{' in response_text_lower and '}' in response_text_lower and re.search(r'\{[a-zA-Z0-9_]+\}', response_text_lower):
+                print(f"⚠️ Found placeholder parameters in content for {url}")
+                has_template_vars = True
                 
-            # Check for errors that might only be visible in rendered content
-            if not has_special_error and response.status_code == 200:
-                try:
-                    driver.get(url)
-                    WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.TAG_NAME, "body"))
-                    )
-                    page_source = driver.page_source.lower()
-                    
-                    # Check for various error indicators in the rendered content
-                    error_indicators = [
-                        "error 1000", 
-                        "dns_probe_finished", 
-                        "this site can't be reached",
-                        "404 not found",
-                        "403 forbidden",
-                        "page not found",
-                        "domain expired",
-                        "website expired",
-                        "domain not found",
-                        "server not found"
-                    ]
-                    
-                    for indicator in error_indicators:
-                        if indicator in page_source:
-                            print(f"Found error indicator '{indicator}' in rendered content for {url}")
-                            has_special_error = True
-                            error_message = f"Error detected: {indicator}"
-                            break
-                            
-                    # Additional Cloudflare specific checks
-                    if "ray id:" in page_source and "cloudflare" in page_source:
-                        if "dns points to" in page_source or "error" in page_source:
-                            print(f"Found Cloudflare error indicators in rendered content for {url}")
-                            has_special_error = True
-                            error_message = "Cloudflare Error (rendered)"
-                except Exception as e:
-                    print(f"Error checking for special errors with Selenium: {e}")
-                    # If we can't check with Selenium, we'll be conservative and mark as error
-                    has_special_error = True
-                    error_message = f"Selenium check failed: {str(e)}"
+            # Quick check for common error terms
+            has_error_terms = False
+            error_terms = ["error", "not found", "404", "403", "forbidden", "expired"]
             
-            # Mark the cell based on the error condition or response status
-            if has_special_error:
-                print(f"Special error detected: {error_message} for {url}")
-                cell_marked = mark_cell_text_red(sheet, row, col)
-            elif response.status_code >= 400:
-                # ALWAYS mark any 4xx or 5xx status as red - no exceptions
+            for term in error_terms:
+                if term in response_text_lower:
+                    print(f"⚠️ Found error term '{term}' in content for {url}")
+                    has_error_terms = True
+                    error_message = f"Error content: {term}"
+                    break
+            
+            # Check HTTP status code first - quickest determination
+            if response.status_code >= 400:
                 error_message = f"HTTP Status {response.status_code}"
                 print(f"❌ HTTP Error: {url} - {error_message}")
-                cell_marked = mark_cell_text_red(sheet, row, col)
-            elif response.status_code == 301 or response.status_code == 302:
-                # Check if redirects lead to a working page
-                print(f"Redirect detected for {url} -> {response.url}")
-                
-                # Analyze the content after redirect to check domain status
-                is_expired, reason = analyze_domain_status(response.text, url, response.url, None, driver)
-                
-                if is_expired:
-                    error_message = f"Domain expired after redirect: {reason}"
-                    print(f"❌ Domain Expired: {url} -> {response.url} - {error_message}")
+                if is_last_url:
                     cell_marked = mark_cell_text_red(sheet, row, col)
                 else:
-                    # Only mark as working if the redirect leads to a proper page
-                    is_working = True
-                    print(f"✅ URL redirects properly: {url} -> {response.url}")
-                    cell_marked = reset_cell_formatting(sheet, row, col)
-            else:
-                # URL returned 200 - analyze content to check domain status
-                content = response.text
-                
-                # Analyze the domain status
-                title = None
+                    print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
+                return False, error_message
+            
+            # For redirects, we trust the final status code but do a quick content check
+            final_url = response.url
+            
+            # Check if we need to use Selenium to verify the page
+            need_selenium_check = (
+                has_template_vars or 
+                has_error_terms or 
+                len(response.text) < 1000 or  # Very short content needs verification
+                '{' in url  # URL contains potential template variables
+            )
+            
+            # Only use Selenium when needed to save time and resources
+            if need_selenium_check:
+                print("Detailed page verification needed - using Selenium")
                 try:
-                    soup = BeautifulSoup(content, 'html.parser')
-                    title_tag = soup.find('title')
-                    if title_tag:
-                        title = title_tag.text.strip()
-                        
-                    # Additional checks for error indicators in HTML or title
-                    error_title_indicators = [
-                        "not found", "error", "forbidden", "expired", 
-                        "404", "403", "500", "unavailable", "sorry"
-                    ]
+                    # Add error handling for tab crashes
+                    max_selenium_retries = 2  # Try up to 2 times with Selenium
+                    selenium_attempt = 0
                     
-                    if title and any(indicator in title.lower() for indicator in error_title_indicators):
-                        print(f"Error indicator found in page title: '{title}' for {url}")
-                        error_message = f"Error page title: {title}"
-                        cell_marked = mark_cell_text_red(sheet, row, col)
-                        # Skip further analysis as we've identified an error
-                        return False, error_message
-                except Exception as e:
-                    print(f"Error analyzing page title: {str(e)}")
-                
-                # Get the final URL after redirects
-                response_url = response.url
-                
-                # Extract domain from URL
-                domain_match = re.search(r'https?://([^/]+)', response_url)
-                if domain_match:
-                    domain = domain_match.group(1)
+                    while selenium_attempt < max_selenium_retries:
+                        try:
+                            # Use the FULL original URL with all parameters
+                            print(f"Loading URL in Selenium (attempt {selenium_attempt+1}): {original_url}")
+                            driver.get(original_url)
+                            
+                            # Shorter wait time to speed up processing
+                            WebDriverWait(driver, 12).until(
+                                EC.presence_of_element_located((By.TAG_NAME, "body"))
+                            )
+                            
+                            # Check for serious errors in rendered page
+                            page_source = driver.page_source.lower()
+                            rendered_error = False
+                            
+                            for indicator in ["error", "not found", "404", "403", "can't be reached"]:
+                                if indicator in page_source:
+                                    print(f"Found error indicator '{indicator}' in rendered content")
+                                    rendered_error = True
+                                    error_message = f"Rendered error: {indicator}"
+                                    break
+                            
+                            if rendered_error:
+                                if is_last_url:
+                                    cell_marked = mark_cell_text_red(sheet, row, col)
+                                else:
+                                    print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
+                                return False, error_message
+                            
+                            # Check for minimal content
+                            text_content = driver.find_element(By.TAG_NAME, "body").text
+                            
+                            if len(text_content.strip()) < 50:
+                                print(f"⚠️ Very little text content found on page: {len(text_content.strip())} chars")
+                                if is_last_url:
+                                    cell_marked = mark_cell_text_red(sheet, row, col)
+                                else:
+                                    print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
+                                return False, "Empty or minimal content page"
+                            
+                            # If we get here without exceptions, break the retry loop
+                            print(f"✅ Selenium verification passed for {url}")
+                            is_working = True
+                            break
+                            
+                        except Exception as selenium_error:
+                            selenium_attempt += 1
+                            error_str = str(selenium_error)
+                            
+                            print(f"Selenium error on attempt {selenium_attempt}: {error_str}")
+                            
+                            # If it's a tab crash, try to reset the driver
+                            if "tab crashed" in error_str:
+                                print("Tab crashed - attempting to restart browser")
+                                try:
+                                    driver.quit()
+                                    browser_restart_count += 1
+                                    driver = setup_selenium()
+                                    await asyncio.sleep(3)  # Give browser a moment to start up
+                                    
+                                    # If this is our last retry and it failed, use request success as fallback
+                                    if selenium_attempt >= max_selenium_retries - 1:
+                                        print("Max Selenium retries reached after tab crash. Falling back to request result.")
+                                        # Since the HTTP request was successful, consider the URL working
+                                        is_working = True
+                                        break
+                                except Exception as restart_error:
+                                    print(f"Error restarting browser: {restart_error}")
+                            
+                            # If this is our last retry with Selenium, use HTTP request result as fallback
+                            if selenium_attempt >= max_selenium_retries:
+                                print("Max Selenium retries reached. Falling back to request result.")
+                                # Since the HTTP request was successful, consider the URL working
+                                is_working = True
+                            else:
+                                # Pause before next attempt
+                                await asyncio.sleep(3)
+                    
+                    # If we've tried the maximum Selenium retries and still had errors,
+                    # use the HTTP response as a fallback check
+                    if selenium_attempt >= max_selenium_retries and not is_working:
+                        print("Selenium verification failed. Using HTTP request result as fallback.")
+                        # If HTTP request was successful (we already checked status code above),
+                        # consider the URL working
+                        is_working = True
+                except Exception as outer_selenium_error:
+                    print(f"❌ Outer Selenium check failed: {str(outer_selenium_error)}")
+                    # Don't automatically fail - since HTTP request was successful,
+                    # consider the URL working despite Selenium issues
+                    is_working = True
+            else:
+                # No need for Selenium check, URL seems good
+                print(f"✅ Basic checks passed for {url}, no need for detailed verification")
+                is_working = True
+            
+            # Mark the cell based on our findings
+            if is_working:
+                print(f"✅ URL is working: {url}")
+                if is_last_url:
+                    cell_marked = reset_cell_formatting(sheet, row, col)
                 else:
-                    domain = response_url
-                
-                # Analyze the content to check domain status
-                is_expired, reason = analyze_domain_status(content, url, response_url, title, driver)
-                
-                if is_expired:
-                    error_message = f"Domain expired: {reason}"
-                    print(f"❌ Domain Expired: {url} - {error_message}")
+                    print(f"Not marking cell blue yet since this is not the last URL in cell {col}{row}")
+            else:
+                print(f"❌ URL is not working properly: {url} - {error_message}")
+                if is_last_url:
                     cell_marked = mark_cell_text_red(sheet, row, col)
                 else:
-                    # Final check - make sure the page isn't a parked domain or empty
-                    parked_domain_indicators = [
-                        "domain is for sale", 
-                        "buy this domain", 
-                        "domain may be for sale", 
-                        "parked domain",
-                        "domain parking"
-                    ]
-                    
-                    is_parked = False
-                    for indicator in parked_domain_indicators:
-                        if indicator in content.lower():
-                            is_parked = True
-                            error_message = f"Parked domain: {indicator}"
-                            break
-                    
-                    # Check if the page is suspiciously small (common for error pages)
-                    is_suspiciously_small = len(content) < 500 and "html" in content.lower()
-                    
-                    if is_parked:
-                        print(f"❌ Parked Domain: {url} - {error_message}")
-                        cell_marked = mark_cell_text_red(sheet, row, col)
-                    elif is_suspiciously_small:
-                        print(f"❌ Suspiciously small page: {url} - only {len(content)} bytes")
-                        cell_marked = mark_cell_text_red(sheet, row, col)
-                    else:
-                        # URL is genuinely working!
-                        is_working = True
-                        print(f"✅ URL is working: {url}")
-                        cell_marked = reset_cell_formatting(sheet, row, col)
+                    print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
                     
         except requests.exceptions.RequestException as e:
-            # ALL connection errors should be marked red - no exceptions
+            # For connection errors, try a fallback check with Selenium
             error_message = str(e)
-            print(f"❌ Connection Error: {url} - {error_message}")
-            cell_marked = mark_cell_text_red(sheet, row, col)
+            print(f"❌ Connection Error with requests: {url} - {error_message}")
+            
+            # Try a fallback with Selenium for connectivity issues
+            try:
+                print(f"Attempting fallback check with Selenium for {url}")
+                driver.get(original_url)  # Use original full URL
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                
+                # If we got here, the page loaded in Selenium despite the request error
+                print(f"✅ Selenium fallback succeeded for {url} despite request error")
+                is_working = True
+                
+                if is_last_url:
+                    cell_marked = reset_cell_formatting(sheet, row, col)
+                else:
+                    print(f"Not marking cell blue yet since this is not the last URL in cell {col}{row}")
+            except Exception as selenium_error:
+                # If both requests and Selenium fail, the URL is definitely not working
+                print(f"❌ Both requests and Selenium failed for {url}")
+                # Only mark the cell if this is the last URL in the cell
+                if is_last_url:
+                    cell_marked = mark_cell_text_red(sheet, row, col)
+                else:
+                    print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
             
     except Exception as e:
         # ANY other exception should be marked red - no exceptions
@@ -724,15 +759,32 @@ async def check_url(driver, url, sheet, row, col, retry_count=0):
         if retry_count < 1:  # Try one more time if there's an unexpected error
             print(f"Retrying URL: {url}")
             await asyncio.sleep(2)  # Wait 2 seconds before retry
-            return await check_url(driver, url, sheet, row, col, retry_count + 1)
+            return await check_url(driver, url, sheet, row, col, retry_count + 1, is_last_url)
         else:
             try:
-                cell_marked = mark_cell_text_red(sheet, row, col)
-                if cell_marked:
-                    print(f"Marked cell {col}{row} as red after retry failure")
+                # Only mark the cell if this is the last URL in the cell or if explicit marking is needed
+                if is_last_url:
+                    cell_marked = mark_cell_text_red(sheet, row, col)
+                    if cell_marked:
+                        print(f"Marked cell {col}{row} as red after retry failure")
+                    else:
+                        print(f"Failed to mark cell {col}{row} as red after retry failure (likely rate limited)")
+                        # Add to pending formats to ensure it gets marked eventually
+                        pending_formats.append({
+                            'sheet': sheet,
+                            'row': row,
+                            'col': col,
+                            'type': 'red',
+                            'url': url,
+                            'retry_count': 0,
+                            'format_key': f"{col}{row}:red"
+                        })
                 else:
-                    print(f"Failed to mark cell {col}{row} as red after retry failure (likely rate limited)")
-                    # Add to pending formats to ensure it gets marked eventually
+                    print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
+            except Exception as mark_err:
+                print(f"❌ Failed to mark cell {col}{row} as red: {str(mark_err)}")
+                # Even if marking fails, still add to pending formats if this is the last URL
+                if is_last_url:
                     pending_formats.append({
                         'sheet': sheet,
                         'row': row,
@@ -742,24 +794,12 @@ async def check_url(driver, url, sheet, row, col, retry_count=0):
                         'retry_count': 0,
                         'format_key': f"{col}{row}:red"
                     })
-            except Exception as mark_err:
-                print(f"❌ Failed to mark cell {col}{row} as red: {str(mark_err)}")
-                # Even if marking fails, still add to pending formats
-                pending_formats.append({
-                    'sheet': sheet,
-                    'row': row,
-                    'col': col,
-                    'type': 'red',
-                    'url': url,
-                    'retry_count': 0,
-                    'format_key': f"{col}{row}:red"
-                })
 
-    # Final safety check - ensure the cell was marked one way or the other
-    if not cell_marked:
+    # Final safety check - ensure the cell was marked one way or the other but ONLY for the final URL
+    if is_last_url and not cell_marked:
         try:
             print(f"⚠️ Cell {col}{row} was not marked during processing - added to pending formats queue with high priority")
-            # Default to red unless we're ABSOLUTELY SURE the URL is working
+            # Default to blue if we're ABSOLUTELY SURE the URL is working
             cell_type = 'blue' if is_working else 'red'
             # Add with higher priority to ensure it gets processed soon
             pending_formats.append({
@@ -775,8 +815,11 @@ async def check_url(driver, url, sheet, row, col, retry_count=0):
             print(f"❌ Final attempt to track cell {col}{row} failed: {str(final_mark_err)}")
             # Last resort - try to mark it red directly
             try:
-                print(f"LAST RESORT: Attempting direct red marking for cell {col}{row}")
-                mark_cell_text_red(sheet, row, col, retry_count=RATE_LIMIT_RETRIES-1)
+                print(f"LAST RESORT: Attempting direct {'blue' if is_working else 'red'} marking for cell {col}{row}")
+                if is_working:
+                    reset_cell_formatting(sheet, row, col, retry_count=RATE_LIMIT_RETRIES-1)
+                else:
+                    mark_cell_text_red(sheet, row, col, retry_count=RATE_LIMIT_RETRIES-1)
             except:
                 print(f"❌❌ ALL ATTEMPTS FAILED for cell {col}{row}. Will be caught by final safety check.")
     
@@ -942,6 +985,9 @@ async def check_links():
             # Collect all URLs to check
             urls_to_check = []
             
+            # Track URLs already processed per cell to handle multiple URLs in a cell
+            processed_cell_urls = {}
+            
             # Convert column letters to indices
             column_indices = [column_to_index(col) for col in URL_COLUMNS]
             
@@ -958,29 +1004,59 @@ async def check_links():
                     if cell_content.strip():  # If cell is not empty
                         # Extract URLs from the cell
                         try:
+                            # Get the cell identifier for tracking
+                            col_name = index_to_column(col_idx)
+                            cell_id = f"{col_name}{row_idx + 1}"
+                            
+                            # Extract all URLs from the cell
                             urls = extract_urls_from_text(cell_content)
+                            
+                            # Initialize tracking for this cell if needed
+                            if cell_id not in processed_cell_urls:
+                                processed_cell_urls[cell_id] = []
+                            
                             if urls:
-                                # Add to the list of URLs to check
-                                for url in urls:
+                                # Process the URLs in reverse order (IMPORTANT: to prioritize the last URL)
+                                # This helps when multiple URLs are in a cell - we want the most recent/updated one
+                                for url in reversed(urls):
+                                    # Skip if we've already processed this exact URL for this cell
+                                    if url in processed_cell_urls[cell_id]:
+                                        print(f"Skipping duplicate URL {url} in cell {cell_id}")
+                                        continue
+                                        
+                                    # Add to the list of URLs to check
                                     urls_to_check.append({
                                         'url': url,
                                         'row': row_idx + 1,  # +1 because we're 0-indexed but sheets are 1-indexed
-                                        'col': index_to_column(col_idx),
-                                        'original_content': cell_content
+                                        'col': col_name,
+                                        'original_content': cell_content,
+                                        'is_last_url': (url == urls[-1])  # Flag if this is the last URL in the cell
                                     })
+                                    
+                                    # Track that we've processed this URL for this cell
+                                    processed_cell_urls[cell_id].append(url)
                             else:
                                 # If no valid URLs found but cell has content, mark it for checking anyway
                                 possible_url = cell_content
                                 if not possible_url.startswith(('http://', 'https://')):
                                     possible_url = 'http://' + possible_url
                                 
+                                # Skip if we've already processed this exact URL for this cell
+                                if possible_url in processed_cell_urls[cell_id]:
+                                    print(f"Skipping duplicate URL {possible_url} in cell {cell_id}")
+                                    continue
+                                    
                                 urls_to_check.append({
                                     'url': possible_url,
                                     'row': row_idx + 1,
-                                    'col': index_to_column(col_idx),
+                                    'col': col_name,
                                     'original_content': cell_content,
-                                    'is_potential_url': True
+                                    'is_potential_url': True,
+                                    'is_last_url': True  # This is the only URL for this cell
                                 })
+                                
+                                # Track that we've processed this URL for this cell
+                                processed_cell_urls[cell_id].append(possible_url)
                         except Exception as e:
                             # If URL extraction fails, still try to check it
                             print(f"❌ Error extracting URLs from cell {index_to_column(col_idx)}{row_idx+1}: {str(e)}")
@@ -990,13 +1066,30 @@ async def check_links():
                                 if not possible_url.startswith(('http://', 'https://')):
                                     possible_url = 'http://' + possible_url
                                 
+                                # Get the cell identifier for tracking
+                                col_name = index_to_column(col_idx)
+                                cell_id = f"{col_name}{row_idx + 1}"
+                                
+                                # Initialize tracking for this cell if needed
+                                if cell_id not in processed_cell_urls:
+                                    processed_cell_urls[cell_id] = []
+                                
+                                # Skip if we've already processed this exact URL for this cell    
+                                if possible_url in processed_cell_urls[cell_id]:
+                                    print(f"Skipping duplicate URL {possible_url} in cell {cell_id}")
+                                    continue
+                                
                                 urls_to_check.append({
                                     'url': possible_url,
                                     'row': row_idx + 1,
-                                    'col': index_to_column(col_idx),
+                                    'col': col_name,
                                     'original_content': cell_content,
-                                    'is_potential_url': True
+                                    'is_potential_url': True,
+                                    'is_last_url': True  # This is the only URL for this cell
                                 })
+                                
+                                # Track that we've processed this URL for this cell
+                                processed_cell_urls[cell_id].append(possible_url)
                             except Exception as inner_e:
                                 print(f"❌ Could not process cell {index_to_column(col_idx)}{row_idx+1}: {str(inner_e)}")
                                 try:
@@ -1060,40 +1153,55 @@ async def check_links():
                     url = url_data['url']
                     row = url_data['row']
                     col = url_data['col']
+                    is_last_url = url_data.get('is_last_url', False)  # Get the flag that indicates if this is the last URL in the cell
                     
                     overall_index = i + idx + 1
                     print(f"Checking URL {overall_index}/{len(urls_to_check)} [{total_cells_processed + 1}]: {url} in cell {col}{row}")
                     
                     try:
-                        await check_url(driver, url, sheet, row, col)
+                        # Pass is_last_url parameter to check_url
+                        await check_url(driver, url, sheet, row, col, is_last_url=is_last_url)
                         total_cells_processed += 1
+                        
+                        # Add a small pause between individual URL checks to reduce system strain
+                        if INTER_URL_PAUSE > 0:
+                            await asyncio.sleep(INTER_URL_PAUSE)
+                            
                     except Exception as e:
                         print(f"❌ Error checking URL {url}: {str(e)}")
                         traceback.print_exc()
                         try:
-                            mark_cell_text_red(sheet, row, col)
+                            # Only mark cell red if this is the last URL in the cell
+                            if is_last_url:
+                                mark_cell_text_red(sheet, row, col)
+                            else:
+                                print(f"Not marking cell red yet since this is not the last URL in cell {col}{row}")
                         except Exception as mark_err:
                             print(f"Error marking cell: {str(mark_err)}")
-                            # Add to pending formats with high priority
-                            pending_formats.append({
-                                'sheet': sheet,
-                                'row': row,
-                                'col': col,
-                                'type': 'red',
-                                'format_key': f"{col}{row}:red",
-                                'retry_count': MAX_PENDING_RETRIES - 3,  # High priority
-                                'url': url
-                            })
+                            # Add to pending formats with high priority but only if this is the last URL
+                            if is_last_url:
+                                pending_formats.append({
+                                    'sheet': sheet,
+                                    'row': row,
+                                    'col': col,
+                                    'type': 'red',
+                                    'format_key': f"{col}{row}:red",
+                                    'retry_count': MAX_PENDING_RETRIES - 3,  # High priority
+                                    'url': url
+                                })
                         total_cells_processed += 1
+                        
+                        # Add a small pause after errors to let the system recover
+                        await asyncio.sleep(INTER_URL_PAUSE * 2)
                 
                 # Process any pending cell formats between batches
                 if pending_formats:
                     print(f"Processing {len(pending_formats)} pending cell formats between batches...")
                     await process_pending_formats()
                 
-                # Give Google's API a break between batches
-                print(f"Completed batch {batch_count}. Sleeping for 30 seconds to avoid API rate limits...")
-                await asyncio.sleep(30)  # Increased from 10 to 30 seconds
+                # Give Google's API a break between batches - use the new BATCH_COMPLETION_PAUSE constant
+                print(f"Completed batch {batch_count}. Pausing for {BATCH_COMPLETION_PAUSE} seconds before next batch...")
+                await asyncio.sleep(BATCH_COMPLETION_PAUSE)
             
             # Final summary
             print(f"\n===== URL CHECKING SUMMARY =====")
