@@ -87,7 +87,7 @@ SECONDS_PER_DAY = 86400
 successfully_formatted_cells = set()
 failed_formatted_cells = set()
 
-# List to track pending cell formats
+# List to track pending cell formats - made properly global
 pending_formats = []
 
 # Print important configuration for debugging
@@ -533,7 +533,7 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
 
 async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=False):
     """Check if a URL is working and mark it in the spreadsheet"""
-    global browser_restart_count
+    global browser_restart_count, pending_formats
     
     print(f"=== Checking URL: {url} at cell {col}{row} {'(FINAL URL in cell)' if is_last_url else ''} ===")
     
@@ -542,6 +542,9 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
     error_message = ""
     cell_marked = False  # Flag to track if we've marked the cell
     original_url = url  # Store the original URL for reference
+    
+    # Initialize has_error_indicators at the beginning to prevent UnboundLocalError
+    has_error_indicators = False
     
     try:
         # Make the actual web request to check the URL
@@ -578,7 +581,6 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                 
                 # Track various indicators for better decision making
                 has_template_vars = False
-                has_error_indicators = False
                 has_parked_domain_indicators = False
                 has_minimal_content = False
                 has_real_content = False
@@ -954,18 +956,6 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                         cell_marked = mark_cell_text_red(sheet, row, col)
                         print(f"Marked cell {col}{row} as red after retry failure")
                     
-                    if not cell_marked:
-                        print(f"Failed to mark cell {col}{row} (likely rate limited)")
-                        # Add to pending formats to ensure it gets marked eventually
-                        pending_formats.append({
-                            'sheet': sheet,
-                            'row': row,
-                            'col': col,
-                            'type': 'blue' if is_working else 'red',
-                            'url': url,
-                            'retry_count': 0,
-                            'format_key': f"{col}{row}:{'blue' if is_working else 'red'}"
-                        })
                 else:
                     print(f"Not marking cell yet since this is not the last URL in cell {col}{row}")
             except Exception as mark_err:
@@ -1127,6 +1117,8 @@ async def process_pending_formats(final_attempt=False):
 
 async def check_links():
     """Check all URLs in the specified columns of the spreadsheet"""
+    global pending_formats  # Explicitly declare global usage
+    
     try:
         print("Setting up Selenium...")
         driver = None  # Will initialize per batch
