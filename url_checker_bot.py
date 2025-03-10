@@ -452,9 +452,15 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
     
     try:
         cell_range = f"{col}{row}"
+        
         # FIX: Create CellFormat properly with a new instance each time
+        # CHANGE: Updated color to #0000EE (0, 0, 238)
         fmt = CellFormat(
-            textFormat=TextFormat(foregroundColor=Color(0.2, 0.6, 1.0))  # RGB for bright blue
+            textFormat=TextFormat(foregroundColor=Color(
+                red=0/255,
+                green=0/255,
+                blue=238/255
+            ))
         )
         
         # Debug output to help diagnose issues
@@ -462,7 +468,7 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
         
         # Apply the formatting
         format_cell_range(sheet, cell_range, fmt)
-        print(f"Marked cell {cell_range} as bright blue (working URL)")
+        print(f"Marked cell {cell_range} as blue (working URL)")
         
         # Track this successful formatting
         successfully_formatted_cells.add(cell_id)
@@ -502,14 +508,14 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
         elif "'dict' object has no attribute 'to_props'" in error_str:
             print(f"⚠️ Encountered 'to_props' error - trying alternative formatting method")
             try:
-                # Try alternative formatting method
+                # Try alternative formatting method with updated color #0000EE
                 worksheet = sheet
                 worksheet.format(cell_range, {
                     "textFormat": {
                         "foregroundColor": {
-                            "red": 0.2,
-                            "green": 0.6,
-                            "blue": 1.0
+                            "red": 0/255,
+                            "green": 0/255,
+                            "blue": 238/255
                         }
                     }
                 })
@@ -956,6 +962,18 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                         cell_marked = mark_cell_text_red(sheet, row, col)
                         print(f"Marked cell {col}{row} as red after retry failure")
                     
+                    if not cell_marked:
+                        print(f"Failed to mark cell {col}{row} (likely rate limited)")
+                        # Add to pending formats to ensure it gets marked eventually
+                        pending_formats.append({
+                            'sheet': sheet,
+                            'row': row,
+                            'col': col,
+                            'type': 'blue' if is_working else 'red',
+                            'url': url,
+                            'retry_count': 0,
+                            'format_key': f"{col}{row}:{'blue' if is_working else 'red'}"
+                        })
                 else:
                     print(f"Not marking cell yet since this is not the last URL in cell {col}{row}")
             except Exception as mark_err:
