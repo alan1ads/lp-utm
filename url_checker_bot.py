@@ -443,12 +443,12 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
     # Get the unique cell identifier
     cell_id = f"{col}{row}"
     
-    # IMPORTANT CHANGE: We will NOT skip formatting even if the cell was already formatted.
-    # This allows changing from red to blue if a working URL is found after a non-working one.
-    # Instead, check if it's already blue (to avoid unnecessary API calls)
-    if cell_id in successfully_formatted_cells and cell_id not in failed_formatted_cells:
-        print(f"Cell {cell_id} was already successfully formatted as blue - skipping")
-        return True
+    # CHANGED: ALWAYS reformat cells to ensure the new color is applied,
+    # regardless of whether they were previously formatted
+    # (temporarily disabled skipping already formatted cells)
+    #if cell_id in successfully_formatted_cells and cell_id not in failed_formatted_cells:
+    #    print(f"Cell {cell_id} was already successfully formatted as blue (#0000EE) - skipping")
+    #    return True
     
     try:
         cell_range = f"{col}{row}"
@@ -464,11 +464,11 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
         )
         
         # Debug output to help diagnose issues
-        print(f"Applying blue format to cell {cell_range}, format type: {type(fmt)}")
+        print(f"Applying blue (#0000EE) format to cell {cell_range}, format type: {type(fmt)}")
         
         # Apply the formatting
         format_cell_range(sheet, cell_range, fmt)
-        print(f"Marked cell {cell_range} as blue (working URL)")
+        print(f"Marked cell {cell_range} as blue (#0000EE) for working URL")
         
         # Track this successful formatting
         successfully_formatted_cells.add(cell_id)
@@ -483,7 +483,7 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
         
         # Check for rate limit errors
         if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str or "quota" in error_str.lower():
-            print(f"⚠️ Rate limit hit while marking cell {cell_range} as blue")
+            print(f"⚠️ Rate limit hit while marking cell {cell_range} as blue (#0000EE)")
             if retry_count < RATE_LIMIT_RETRIES:
                 # Calculate exponential backoff with jitter
                 jitter = random.uniform(0.5, 1.5)
@@ -499,6 +499,7 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
                 'row': row,
                 'col': col,
                 'type': 'blue',
+                'retry_count': retry_count,
                 'format_key': f"{col}{row}:blue"
             })
             failed_formatted_cells.add(cell_id)
@@ -519,7 +520,7 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
                         }
                     }
                 })
-                print(f"Marked cell {cell_range} as blue using alternative method")
+                print(f"Marked cell {cell_range} as blue (#0000EE) using alternative method")
                 
                 # Track successful formatting
                 successfully_formatted_cells.add(cell_id)
@@ -532,7 +533,7 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
                 failed_formatted_cells.add(cell_id)
                 return False
                 
-        print(f"❌ Error marking cell {cell_range} as blue: {error_str}")
+        print(f"❌ Error marking cell {cell_range} as blue (#0000EE): {error_str}")
         # Track this failed formatting
         failed_formatted_cells.add(cell_id)
         return False
@@ -957,7 +958,7 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                 if is_last_url:
                     if is_working:
                         cell_marked = reset_cell_formatting(sheet, row, col)
-                        print(f"Marked cell {col}{row} as blue (working landing page)")
+                        print(f"Marked cell {col}{row} as blue (#0000EE) for working URL")
                     else:
                         cell_marked = mark_cell_text_red(sheet, row, col)
                         print(f"Marked cell {col}{row} as red after retry failure")
@@ -1003,22 +1004,14 @@ async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=Fal
                 'col': col,
                 'type': cell_type,
                 'url': url,
-                'retry_count': MAX_PENDING_RETRIES - 3,  # Higher priority
-                'format_key': f"{col}{row}:{cell_type}"
+                'retry_count': 0,
+                'format_key': f"{col}{row}:{cell_type + ' (#0000EE)' if cell_type == 'blue' else cell_type}"
             })
-        except Exception as final_mark_err:
-            print(f"❌ Final attempt to track cell {col}{row} failed: {str(final_mark_err)}")
-            # Last resort - try to mark it red directly
-            try:
-                print(f"LAST RESORT: Attempting direct {'blue' if is_working else 'red'} marking for cell {col}{row}")
-                if is_working:
-                    reset_cell_formatting(sheet, row, col, retry_count=RATE_LIMIT_RETRIES-1)
-                else:
-                    mark_cell_text_red(sheet, row, col, retry_count=RATE_LIMIT_RETRIES-1)
-            except:
-                print(f"❌❌ ALL ATTEMPTS FAILED for cell {col}{row}. Will be caught by final safety check.")
-    
-    return is_working, error_message
+            
+        except Exception as e:
+            print(f"❌ Failed to add cell {col}{row} to pending formats: {str(e)}")
+            
+    return is_working
 
 def column_to_index(column_name):
     """Convert column name (A, B, C, ..., AA, AB, etc.) to 0-based index"""
@@ -1135,7 +1128,11 @@ async def process_pending_formats(final_attempt=False):
 
 async def check_links():
     """Check all URLs in the specified columns of the spreadsheet"""
-    global pending_formats  # Explicitly declare global usage
+    global pending_formats, successfully_formatted_cells, failed_formatted_cells
+    
+    # ADDED: Clear the successful formatting tracking to force reformatting of all cells
+    successfully_formatted_cells = set()
+    failed_formatted_cells = set()
     
     try:
         print("Setting up Selenium...")
