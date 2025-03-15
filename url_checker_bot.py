@@ -357,32 +357,145 @@ def mark_cell_text_red(sheet, row, col, retry_count=0, backoff_seconds=1):
         # Define the cell range for formatting
         cell_range = f"{col}{row}"
         
-        # FIX: Create CellFormat properly with a new instance each time
-        fmt = CellFormat(
-            textFormat=TextFormat(foregroundColor=Color(0.95, 0.2, 0.1))  # Red
-        )
-        
-        # Debug output to help diagnose issues
-        print(f"Applying red format to cell {cell_range}, format type: {type(fmt)}")
-        
-        # Apply the formatting
-        format_cell_range(sheet, cell_range, fmt)
-        print(f"Marked cell {cell_range} as red (failed URL)")
-        
-        # Track this successful formatting
-        failed_formatted_cells.add(cell_id)
-        
-        # If this was in the successfully formatted set, remove it as it's now failed
-        if cell_id in successfully_formatted_cells:
-            successfully_formatted_cells.remove(cell_id)
+        # IMPROVED: More robust approach with direct API calls
+        try:
+            # First try with gspread-formatting
+            fmt = CellFormat(
+                textFormat=TextFormat(foregroundColor=Color(0.95, 0.2, 0.1))  # Red
+            )
             
-        return True
+            # Debug output
+            print(f"Applying red format to cell {cell_range}, format type: {type(fmt)}")
+            
+            # Apply the formatting
+            format_cell_range(sheet, cell_range, fmt)
+            
+            # ADDED: Explicit sleep after formatting to let it take effect
+            time.sleep(0.5)
+            
+            print(f"Marked cell {cell_range} as red (failed URL)")
+            
+            # Track this successful formatting
+            failed_formatted_cells.add(cell_id)
+            
+            # If this was in the successfully formatted set, remove it as it's now failed
+            if cell_id in successfully_formatted_cells:
+                successfully_formatted_cells.remove(cell_id)
+                
+            return True
+            
+        except Exception as format_err:
+            print(f"First formatting method failed: {str(format_err)}")
+            
+            # Try an even more direct approach - batch update API
+            try:
+                # Use the spreadsheet's batch_update method directly
+                worksheet_id = sheet.id
+                spreadsheet_id = sheet._properties['spreadsheetId']
+                
+                # Get the proper grid coordinates
+                grid_range = {
+                    "sheetId": worksheet_id,
+                    "startRowIndex": row - 1,  # 0-indexed
+                    "endRowIndex": row,
+                    "startColumnIndex": column_to_index(col),
+                    "endColumnIndex": column_to_index(col) + 1
+                }
+                
+                # Prepare the batch update request
+                batch_request = {
+                    "requests": [
+                        {
+                            "repeatCell": {
+                                "range": grid_range,
+                                "cell": {
+                                    "userEnteredFormat": {
+                                        "textFormat": {
+                                            "foregroundColor": {
+                                                "red": 0.95,
+                                                "green": 0.2,
+                                                "blue": 0.1
+                                            }
+                                        }
+                                    }
+                                },
+                                "fields": "userEnteredFormat.textFormat.foregroundColor"
+                            }
+                        }
+                    ]
+                }
+                
+                # Execute the batch update
+                sheet.spreadsheet.batch_update(batch_request)
+                time.sleep(0.5)  # Sleep to let it take effect
+                
+                print(f"Marked cell {cell_range} as red using batch update API")
+                
+                # Track this successful formatting
+                failed_formatted_cells.add(cell_id)
+                if cell_id in successfully_formatted_cells:
+                    successfully_formatted_cells.remove(cell_id)
+                    
+                return True
+                
+            except Exception as batch_err:
+                print(f"Batch update also failed: {str(batch_err)}")
+                
+                # Try the 'to_props' workaround as a last resort
+                if "'dict' object has no attribute 'to_props'" in str(format_err):
+                    try:
+                        worksheet = sheet
+                        worksheet.format(cell_range, {
+                            "textFormat": {
+                                "foregroundColor": {
+                                    "red": 0.95,
+                                    "green": 0.2,
+                                    "blue": 0.1
+                                }
+                            }
+                        })
+                        time.sleep(0.5)  # Sleep to let it take effect
+                        print(f"Marked cell {cell_range} as red using alternative method")
+                        
+                        # Track successful formatting
+                        failed_formatted_cells.add(cell_id)
+                        if cell_id in successfully_formatted_cells:
+                            successfully_formatted_cells.remove(cell_id)
+                            
+                        return True
+                    except Exception as inner_e:
+                        print(f"❌ Alternative formatting method also failed: {str(inner_e)}")
+                
+                # At this point, all methods have failed
+                print(f"❌ All formatting methods failed for cell {cell_range}")
+                
+                # Check for rate limit and retry
+                if retry_count < RATE_LIMIT_RETRIES:
+                    jitter = random.uniform(0.5, 1.5)
+                    retry_seconds = min(backoff_seconds * (2 ** retry_count) * jitter, RATE_LIMIT_PAUSE_MAX)
+                    print(f"Retrying cell {cell_id} in {retry_seconds:.1f} seconds (retry {retry_count+1}/{RATE_LIMIT_RETRIES})")
+                    time.sleep(retry_seconds)
+                    return mark_cell_text_red(sheet, row, col, retry_count + 1, backoff_seconds)
+                
+                # Add to pending formats with high priority
+                print(f"Maximum retries reached for cell {cell_range}. Adding to high-priority pending formats queue.")
+                pending_formats.append({
+                    'sheet': sheet,
+                    'row': row,
+                    'col': col,
+                    'type': 'red',
+                    'format_key': f"{col}{row}:red",
+                    'retry_count': MAX_PENDING_RETRIES - 5  # High priority
+                })
+                failed_formatted_cells.add(cell_id)
+                return False
+    
     except Exception as e:
         error_str = str(e)
+        print(f"❌ Error marking cell {cell_range} as red: {error_str}")
         
-        # Check for rate limit errors
+        # Check for rate limits one more time
         if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str or "quota" in error_str.lower():
-            print(f"⚠️ Rate limit hit while marking cell {cell_range} as red")
             if retry_count < RATE_LIMIT_RETRIES:
                 # Calculate exponential backoff with jitter
                 jitter = random.uniform(0.5, 1.5)
@@ -390,100 +503,145 @@ def mark_cell_text_red(sheet, row, col, retry_count=0, backoff_seconds=1):
                 print(f"Retrying in {retry_seconds:.1f} seconds (retry {retry_count+1}/{RATE_LIMIT_RETRIES})")
                 time.sleep(retry_seconds)
                 return mark_cell_text_red(sheet, row, col, retry_count + 1, backoff_seconds)
-            
-            # Add to pending formats to retry later
-            print(f"Maximum retries reached for cell {cell_range}. Adding to pending formats queue.")
-            pending_formats.append({
-                'sheet': sheet,
-                'row': row,
-                'col': col,
-                'type': 'red',
-                'format_key': f"{col}{row}:red"
-            })
-            failed_formatted_cells.add(cell_id)
-            return False
         
-        # Check for the 'to_props' error
-        elif "'dict' object has no attribute 'to_props'" in error_str:
-            print(f"⚠️ Encountered 'to_props' error - trying alternative formatting method")
-            try:
-                # Try alternative formatting method
-                worksheet = sheet
-                worksheet.format(cell_range, {
-                    "textFormat": {
-                        "foregroundColor": {
-                            "red": 0.95,
-                            "green": 0.2,
-                            "blue": 0.1
-                        }
-                    }
-                })
-                print(f"Marked cell {cell_range} as red using alternative method")
-                
-                # Track successful formatting
-                failed_formatted_cells.add(cell_id)
-                if cell_id in successfully_formatted_cells:
-                    successfully_formatted_cells.remove(cell_id)
-                    
-                return True
-            except Exception as inner_e:
-                print(f"❌ Alternative formatting method also failed: {str(inner_e)}")
-                failed_formatted_cells.add(cell_id)
-                return False
+        # Add to pending formats with high priority
+        pending_formats.append({
+            'sheet': sheet,
+            'row': row,
+            'col': col,
+            'type': 'red',
+            'format_key': f"{col}{row}:red",
+            'retry_count': MAX_PENDING_RETRIES - 5  # High priority
+        })
         
-        print(f"❌ Error marking cell {cell_range} as red: {error_str}")
         # Track this failed formatting
         failed_formatted_cells.add(cell_id)
         return False
 
 def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
-    """Reset cell formatting to bright blue for working URLs"""
+    """Reset cell formatting to bright blue (#0000EE) for working URLs"""
     global pending_formats, successfully_formatted_cells, failed_formatted_cells
     
     # Get the unique cell identifier
     cell_id = f"{col}{row}"
     
-    # CHANGED: ALWAYS reformat cells to ensure the new color is applied,
-    # regardless of whether they were previously formatted
-    # (temporarily disabled skipping already formatted cells)
-    #if cell_id in successfully_formatted_cells and cell_id not in failed_formatted_cells:
-    #    print(f"Cell {cell_id} was already successfully formatted as blue (#0000EE) - skipping")
-    #    return True
+    # COMMENTED OUT: We'll always reformat, ignoring previous blue
+    # if cell_id in successfully_formatted_cells and cell_id not in failed_formatted_cells:
+    #     print(f"Cell {cell_id} was already marked blue - skipping")
+    #     return True
     
     try:
+        # Define the cell range for formatting
         cell_range = f"{col}{row}"
         
-        # FIX: Create CellFormat properly with a new instance each time
-        # CHANGE: Updated color to #0000EE (0, 0, 238)
-        fmt = CellFormat(
-            textFormat=TextFormat(foregroundColor=Color(
-                red=0/255,
-                green=0/255,
-                blue=238/255
-            ))
-        )
-        
-        # Debug output to help diagnose issues
-        print(f"Applying blue (#0000EE) format to cell {cell_range}, format type: {type(fmt)}")
-        
-        # Apply the formatting
-        format_cell_range(sheet, cell_range, fmt)
-        print(f"Marked cell {cell_range} as blue (#0000EE) for working URL")
-        
-        # Track this successful formatting
-        successfully_formatted_cells.add(cell_id)
-        
-        # If this was in the failed set, remove it
-        if cell_id in failed_formatted_cells:
-            failed_formatted_cells.remove(cell_id)
+        try:
+            # First try with direct batch update - most reliable
+            worksheet_id = sheet.id
+            spreadsheet_id = sheet._properties['spreadsheetId']
             
-        return True
+            # Get the proper grid coordinates
+            grid_range = {
+                "sheetId": worksheet_id,
+                "startRowIndex": row - 1,  # 0-indexed
+                "endRowIndex": row,
+                "startColumnIndex": column_to_index(col),
+                "endColumnIndex": column_to_index(col) + 1
+            }
+            
+            # Prepare the batch update request
+            batch_request = {
+                "requests": [
+                    {
+                        "repeatCell": {
+                            "range": grid_range,
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "textFormat": {
+                                        "foregroundColor": {
+                                            "red": 0,
+                                            "green": 0,
+                                            "blue": 238/255  # #0000EE
+                                        }
+                                    }
+                                }
+                            },
+                            "fields": "userEnteredFormat.textFormat.foregroundColor"
+                        }
+                    }
+                ]
+            }
+            
+            # Execute the batch update
+            sheet.spreadsheet.batch_update(batch_request)
+            time.sleep(0.5)  # Sleep to let it take effect
+            
+            print(f"Marked cell {cell_range} as blue #0000EE using batch update API")
+            
+            # Track this successful formatting
+            successfully_formatted_cells.add(cell_id)
+            if cell_id in failed_formatted_cells:
+                failed_formatted_cells.remove(cell_id)
+                
+            return True
+            
+        except Exception as batch_err:
+            print(f"Batch update failed: {str(batch_err)}")
+            
+            # Fall back to original method
+            fmt = CellFormat(
+                textFormat=TextFormat(foregroundColor=Color(0, 0, 238/255))  # Blue #0000EE
+            )
+            
+            # Debug output
+            print(f"Applying blue #0000EE format to cell {cell_range}, format type: {type(fmt)}")
+            
+            # Apply the formatting
+            format_cell_range(sheet, cell_range, fmt)
+            
+            # ADDED: Explicit sleep after formatting to let it take effect
+            time.sleep(0.5)
+            
+            # REMOVED: verification code that might use undefined functions
+            
+            print(f"Marked cell {cell_range} as blue #0000EE")
+            
+            # Track this successful formatting
+            successfully_formatted_cells.add(cell_id)
+            if cell_id in failed_formatted_cells:
+                failed_formatted_cells.remove(cell_id)
+                
+            return True
+            
     except Exception as e:
         error_str = str(e)
+        print(f"❌ Error marking cell {cell_range} as blue #0000EE: {error_str}")
         
-        # Check for rate limit errors
+        # Try one more alternative method if possible
+        try:
+            worksheet = sheet
+            worksheet.format(cell_range, {
+                "textFormat": {
+                    "foregroundColor": {
+                        "red": 0,
+                        "green": 0,
+                        "blue": 238/255  # #0000EE
+                    }
+                }
+            })
+            time.sleep(0.5)  # Sleep to let it take effect
+            print(f"Marked cell {cell_range} as blue using alternative method")
+            
+            # Track successful formatting
+            successfully_formatted_cells.add(cell_id)
+            if cell_id in failed_formatted_cells:
+                failed_formatted_cells.remove(cell_id)
+                
+            return True
+        except Exception as alt_err:
+            print(f"Alternative method also failed: {str(alt_err)}")
+        
+        # Check for rate limits
         if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str or "quota" in error_str.lower():
-            print(f"⚠️ Rate limit hit while marking cell {cell_range} as blue (#0000EE)")
             if retry_count < RATE_LIMIT_RETRIES:
                 # Calculate exponential backoff with jitter
                 jitter = random.uniform(0.5, 1.5)
@@ -491,52 +649,44 @@ def reset_cell_formatting(sheet, row, col, retry_count=0, backoff_seconds=1):
                 print(f"Retrying in {retry_seconds:.1f} seconds (retry {retry_count+1}/{RATE_LIMIT_RETRIES})")
                 time.sleep(retry_seconds)
                 return reset_cell_formatting(sheet, row, col, retry_count + 1, backoff_seconds)
-                
-            # Add to pending formats to retry later
-            print(f"Maximum retries reached for cell {cell_range}. Adding to pending formats queue.")
-            pending_formats.append({
-                'sheet': sheet,
-                'row': row,
-                'col': col,
-                'type': 'blue',
-                'retry_count': retry_count,
-                'format_key': f"{col}{row}:blue"
-            })
-            failed_formatted_cells.add(cell_id)
-            return False
-            
-        # Check for the 'to_props' error
-        elif "'dict' object has no attribute 'to_props'" in error_str:
-            print(f"⚠️ Encountered 'to_props' error - trying alternative formatting method")
-            try:
-                # Try alternative formatting method with updated color #0000EE
-                worksheet = sheet
-                worksheet.format(cell_range, {
-                    "textFormat": {
-                        "foregroundColor": {
-                            "red": 0/255,
-                            "green": 0/255,
-                            "blue": 238/255
-                        }
-                    }
-                })
-                print(f"Marked cell {cell_range} as blue (#0000EE) using alternative method")
-                
-                # Track successful formatting
-                successfully_formatted_cells.add(cell_id)
-                if cell_id in failed_formatted_cells:
-                    failed_formatted_cells.remove(cell_id)
-                    
-                return True
-            except Exception as inner_e:
-                print(f"❌ Alternative formatting method also failed: {str(inner_e)}")
-                failed_formatted_cells.add(cell_id)
-                return False
-                
-        print(f"❌ Error marking cell {cell_range} as blue (#0000EE): {error_str}")
-        # Track this failed formatting
-        failed_formatted_cells.add(cell_id)
+        
+        # Add to pending formats
+        pending_formats.append({
+            'sheet': sheet,
+            'row': row,
+            'col': col,
+            'type': 'blue',
+            'format_key': f"{col}{row}:blue",
+            'retry_count': retry_count
+        })
+        
         return False
+
+# Add a helper function to extract color from format
+def get_text_color_from_format(cell_format):
+    """Extract text color from cell format"""
+    try:
+        if not cell_format or not hasattr(cell_format, 'textFormat'):
+            return None
+            
+        if not cell_format.textFormat or not hasattr(cell_format.textFormat, 'foregroundColor'):
+            return None
+            
+        color = cell_format.textFormat.foregroundColor
+        
+        if not color:
+            return None
+            
+        # Approximate color detection
+        if hasattr(color, 'red') and hasattr(color, 'green') and hasattr(color, 'blue'):
+            if color.red > 0.7 and color.green < 0.4 and color.blue < 0.4:
+                return "red"
+            elif color.red < 0.1 and color.green < 0.1 and color.blue > 0.7:
+                return "blue"
+                
+        return f"rgb({getattr(color, 'red', 0)}, {getattr(color, 'green', 0)}, {getattr(color, 'blue', 0)})"
+    except:
+        return None
 
 async def check_url(driver, url, sheet, row, col, retry_count=0, is_last_url=False):
     """Check if a URL is working and mark it in the spreadsheet"""
